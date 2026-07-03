@@ -238,3 +238,4 @@ Web Keeper is most useful for ordinary HLS streams and normal downloadable attac
 - Shared archive manifest: record source URL, page URL, headers source, original filename, saved path, file size, checksum when practical, and retry status for archive and image downloads.
 - Internal rename cleanup: eventually rename package and scripts from `hls_keeper` / HLS Keeper to Web Keeper when it is worth the migration cost.
 - Chinese (zh-CN) UI localisation: translate the Dashboard and extension popup into Simplified Chinese, ideally behind a language toggle. The UI is currently Australian English only.
+- Study existing video downloader extensions for feature and UX reference, e.g. Video DownloadHelper and CocoCut: media detection UI on the toolbar icon (badge with candidate count), per-tab candidate lists, one-click quality pick, and broader site/format coverage.

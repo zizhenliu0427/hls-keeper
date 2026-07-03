@@ -209,3 +209,4 @@ Web Keeper 最适合普通 HLS 流和普通附件下载。以下情况可能无�
 - Shared archive manifest：记录来源 URL、页面 URL、headers 来源、原始文件名、保存路径、文件大小、可行时的 checksum 和重试状态。
 - Internal rename cleanup：未来在迁移成本合适时，把包名和脚本从 `hls_keeper` / HLS Keeper 彻底改为 Web Keeper。
 - 中文界面本地化：把 Dashboard 和扩展 popup 界面翻译成简体中文，最好提供语言切换。当前界面仅为英文（澳式英语）。
+- 参考现有视频下载类浏览器扩展的功能与交互，例如 Video DownloadHelper、CocoCut：工具栏图标上的媒体检测提示（角标显示候选数量）、按标签页分组的候选列表、一键选择画质，以及更广的站点和格式覆盖。
