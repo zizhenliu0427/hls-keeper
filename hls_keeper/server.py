@@ -15,9 +15,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
+
+from .archive import FanboxArchiveDownloader, parse_headers_json
 
 
 APP_NAME = "HLS Keeper"
@@ -25,6 +27,7 @@ APP_VERSION = "0.1.0"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = ROOT / "data"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
+DEFAULT_ARCHIVE_DIR = ROOT / "archives"
 DEFAULT_FFMPEG = r"C:\ffmpeg\bin\ffmpeg.exe"
 DEFAULT_FFPROBE = r"C:\ffmpeg\bin\ffprobe.exe"
 
@@ -329,6 +332,7 @@ class CaptureStore:
         self,
         data_dir: Path,
         output_dir: Path,
+        archive_dir: Path,
         ffmpeg: str,
         workers: int,
         burst_ahead: int,
@@ -338,6 +342,7 @@ class CaptureStore:
     ):
         self.data_dir = data_dir
         self.output_dir = output_dir
+        self.archive_dir = archive_dir
         self.ffmpeg = ffmpeg
         self.ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe")) if ffmpeg.lower().endswith(".exe") else "ffprobe"
         self.workers = workers
@@ -352,6 +357,7 @@ class CaptureStore:
         self.request_log_path = data_dir / "requests.jsonl"
         self.capture_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.session = requests.Session()
@@ -394,6 +400,7 @@ class CaptureStore:
             "streams": {},
             "jobs": {},
             "candidates": {},
+            "archive_headers": {},
             "subtitle_hints": [],
             "last_ping": None,
             "created_at": now(),
@@ -913,6 +920,7 @@ class CaptureStore:
             last_ping = self.state.get("last_ping")
             jobs = dict(self.state.get("jobs", {}))
             candidates = dict(self.state.get("candidates", {}))
+            archive_headers = dict(self.state.get("archive_headers", {}))
             subtitle_hints = list(self.state.get("subtitle_hints", []))
             inflight = len(self.inflight)
         rows = self.list_streams()
@@ -948,6 +956,13 @@ class CaptureStore:
             "streams": rows,
             "jobs": sorted(jobs.values(), key=lambda job: job.get("created_at", 0), reverse=True)[:50],
             "candidates": safe_candidates,
+            "archive_headers": {
+                key: {
+                    **{name: value for name, value in item.items() if name != "headers"},
+                    "redacted_headers": redacted_headers(dict(item.get("headers") or {})),
+                }
+                for key, item in archive_headers.items()
+            },
             "subtitle_hints": [
                 {
                     "url": item.get("url"),
@@ -972,6 +987,144 @@ class CaptureStore:
                 if stream.get("product") == product and stream.get("sample_headers"):
                     return dict(stream["sample_headers"])
         return {}
+
+    def record_archive_headers(self, payload: dict[str, Any]) -> tuple[int, str]:
+        site = safe_name(str(payload.get("site") or "generic").lower())
+        url = str(payload.get("url") or "")
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        creator_id = (query.get("creatorId") or [""])[0]
+        headers = headers_from_browser(payload.get("requestHeaders", []))
+        if not headers:
+            return 204, "ignored"
+        record = {
+            "site": site,
+            "url": url,
+            "host": parsed.netloc,
+            "path": parsed.path,
+            "creator_id": creator_id,
+            "headers": headers,
+            "redacted_headers": redacted_headers(headers),
+            "method": payload.get("method") or "GET",
+            "initiator": payload.get("initiator") or "",
+            "tab_id": payload.get("tabId"),
+            "timeStamp": payload.get("timeStamp"),
+            "updated_at": now(),
+        }
+        with self.lock:
+            archive_headers = self.state.setdefault("archive_headers", {})
+            archive_headers[site] = record
+            if creator_id:
+                archive_headers[f"{site}:{safe_name(creator_id)}"] = record
+            self.save_state()
+        return 200, "archive headers saved"
+
+    def best_archive_headers(self, site: str, creator_id: str = "") -> dict[str, str]:
+        site_key = safe_name(site.lower())
+        creator_key = f"{site_key}:{safe_name(creator_id)}" if creator_id else ""
+        with self.lock:
+            archive_headers = self.state.get("archive_headers", {})
+            if creator_key and archive_headers.get(creator_key, {}).get("headers"):
+                return dict(archive_headers[creator_key]["headers"])
+            if archive_headers.get(site_key, {}).get("headers"):
+                return dict(archive_headers[site_key]["headers"])
+        return {}
+
+    def start_archive_fanbox(self, payload: dict[str, Any]) -> dict[str, Any]:
+        creator_id = str(payload.get("creator_id") or payload.get("creatorId") or "").strip()
+        if not creator_id:
+            raise RuntimeError("creator_id is required")
+        start_page = max(1, int(payload.get("start_page") or 1))
+        end_page_raw = payload.get("end_page")
+        end_page = int(end_page_raw) if str(end_page_raw or "").strip() else None
+        if end_page is not None and end_page < start_page:
+            raise RuntimeError("end_page must be greater than or equal to start_page")
+        limit = max(1, min(int(payload.get("limit") or 10), 100))
+        workers = max(1, min(int(payload.get("workers") or 4), 32))
+        request_delay_ms = max(0, min(int(payload.get("request_delay_ms") or 100), 10000))
+        zip_only = bool(payload.get("zip_only", True))
+        manual_headers = dict(payload.get("headers") or {})
+        manual_headers.update(parse_headers_json(payload.get("headers_json")))
+        saved_headers = self.best_archive_headers("fanbox", creator_id) if payload.get("use_saved_headers", True) else {}
+        headers = {**saved_headers, **manual_headers}
+        output_dir_text = str(payload.get("output_dir") or "").strip()
+        output_dir = Path(output_dir_text).expanduser() if output_dir_text else self.archive_dir / "fanbox" / safe_name(creator_id)
+
+        job_seed = f"archive-fanbox|{creator_id}|{start_page}|{end_page}|{time.time_ns()}"
+        job_id = f"job_{int(time.time())}_{abs(hash(job_seed)) % 1000000:06d}"
+        job = {
+            "id": job_id,
+            "type": "archive-fanbox",
+            "status": "queued",
+            "product": f"fanbox/{creator_id}",
+            "resolution": f"pages {start_page}-{end_page or 'end'}",
+            "creator_id": creator_id,
+            "start_page": start_page,
+            "end_page": end_page,
+            "output_dir": str(output_dir),
+            "workers": workers,
+            "request_delay_ms": request_delay_ms,
+            "zip_only": zip_only,
+            "use_saved_headers": bool(saved_headers),
+            "manual_headers": bool(manual_headers),
+            "created_at": now(),
+            "updated_at": now(),
+            "total": 0,
+            "done": 0,
+            "saved": 0,
+            "skipped_existing": 0,
+            "saved_bytes": 0,
+            "failed": 0,
+            "message": "",
+        }
+        with self.lock:
+            self.state.setdefault("jobs", {})[job_id] = job
+            self.save_state()
+        threading.Thread(
+            target=self.run_archive_fanbox,
+            args=(job_id, creator_id, output_dir, headers, workers, request_delay_ms, zip_only, start_page, end_page, limit),
+            daemon=True,
+        ).start()
+        return job
+
+    def run_archive_fanbox(
+        self,
+        job_id: str,
+        creator_id: str,
+        output_dir: Path,
+        headers: dict[str, str],
+        workers: int,
+        request_delay_ms: int,
+        zip_only: bool,
+        start_page: int,
+        end_page: int | None,
+        limit: int,
+    ) -> None:
+        try:
+            self.update_job(job_id, status="starting", message="Starting FANBOX archive download")
+            downloader = FanboxArchiveDownloader(
+                output_root=output_dir,
+                headers=headers,
+                workers=workers,
+                request_delay_ms=request_delay_ms,
+                zip_only=zip_only,
+                update=lambda **updates: self.update_job(job_id, **updates),
+            )
+            result = downloader.download_creator(
+                creator_id=creator_id,
+                start_page=start_page,
+                end_page=end_page,
+                limit=limit,
+            )
+            final_status = "complete" if int(result.get("failed") or 0) == 0 else "warning"
+            self.update_job(
+                job_id,
+                status=final_status,
+                **result,
+                message=f"Archive download finished: saved {result.get('saved', 0)}, existing {result.get('skipped_existing', 0)}, failed {result.get('failed', 0)}",
+            )
+        except Exception as exc:
+            self.update_job(job_id, status="failed", message=str(exc))
 
     def start_direct_download(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = payload.get("url", "").strip()
@@ -2296,6 +2449,24 @@ DASHBOARD_HTML = r"""<!doctype html>
         <button id="startSubtitleOnly">Download CC only</button>
       </div>
     </section>
+    <section class="stat" style="margin-bottom:16px">
+      <div class="label">Archive: FANBOX ZIP attachments</div>
+      <div style="display:grid; grid-template-columns: 160px 90px 90px 90px 90px 110px; gap:8px; margin-top:8px">
+        <input id="archiveCreator" placeholder="creatorId, e.g. dollhouse">
+        <input id="archiveStartPage" type="number" min="1" value="1" title="Start page">
+        <input id="archiveEndPage" type="number" min="1" placeholder="end" title="End page, blank = all">
+        <input id="archiveWorkers" type="number" min="1" max="32" value="4" title="Parallel workers">
+        <input id="archiveDelay" type="number" min="0" max="10000" value="100" title="Delay ms/request">
+        <label><input id="archiveZipOnly" type="checkbox" checked> ZIP only</label>
+      </div>
+      <input id="archiveOutput" placeholder="optional output folder, blank = archives/fanbox/<creatorId>" style="box-sizing:border-box;width:100%;margin-top:8px">
+      <textarea id="archiveHeaders" placeholder='optional headers JSON override/fallback, e.g. {"cookie":"FANBOXSESSID=..."}' style="box-sizing:border-box;width:100%;height:62px;margin-top:8px;font:12px Consolas,monospace"></textarea>
+      <div class="toolbar" style="margin:8px 0 0">
+        <label><input id="archiveUseSavedHeaders" type="checkbox" checked> use saved browser headers first</label>
+        <button id="startArchiveFanbox">Start FANBOX archive</button>
+        <span id="archiveHeaderStatus" class="label">Open FANBOX with Discover enabled to capture headers automatically.</span>
+      </div>
+    </section>
     <table>
       <thead>
         <tr>
@@ -2335,6 +2506,12 @@ DASHBOARD_HTML = r"""<!doctype html>
       $("heartbeat").textContent = ping ? `${ping.reason} ${new Date(ping.server_time * 1000).toLocaleTimeString()}` : "no extension ping";
       const latestCcJob = (status.jobs || []).find(job => String(job.type || "").includes("subtitle"));
       const shortCcJob = latestCcJob && latestCcJob.status === "warning" && String(latestCcJob.message || "").toLowerCase().includes("cc looks short") ? latestCcJob : null;
+      const fanboxHeaders = (status.archive_headers || {}).fanbox || null;
+      if (fanboxHeaders && fanboxHeaders.updated_at) {
+        $("archiveHeaderStatus").textContent = `saved FANBOX headers: ${fanboxHeaders.host || "fanbox"} ${new Date(fanboxHeaders.updated_at * 1000).toLocaleTimeString()}`;
+      } else {
+        $("archiveHeaderStatus").textContent = "Open FANBOX with Discover enabled to capture headers automatically.";
+      }
       const subtitleNotice = $("subtitleNotice");
       if (shortCcJob) {
         subtitleNotice.classList.add("show");
@@ -2438,6 +2615,25 @@ DASHBOARD_HTML = r"""<!doctype html>
         if (btn.id === "retryAll") {
           const result = await api("/api/retry-missing", { method: "POST", headers: {"content-type":"application/json"}, body: "{}" });
           log(`retry queued ${result.queued}`);
+          return refresh();
+        }
+        if (btn.id === "startArchiveFanbox") {
+          const result = await api("/api/archive/fanbox", {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({
+              creator_id: $("archiveCreator").value.trim(),
+              start_page: Number($("archiveStartPage").value || 1),
+              end_page: $("archiveEndPage").value.trim(),
+              workers: Number($("archiveWorkers").value || 4),
+              request_delay_ms: Number($("archiveDelay").value || 100),
+              zip_only: $("archiveZipOnly").checked,
+              use_saved_headers: $("archiveUseSavedHeaders").checked,
+              output_dir: $("archiveOutput").value.trim(),
+              headers_json: $("archiveHeaders").value.trim()
+            })
+          });
+          log(`archive job started: ${result.id}`);
           return refresh();
         }
         if (btn.id === "startDirect") {
@@ -2616,6 +2812,10 @@ def make_handler(store: CaptureStore):
                     status, message = store.enqueue_payload(payload)
                     self.send_json(status, {"message": message})
                     return
+                if parsed.path == "/api/archive/headers":
+                    status, message = store.record_archive_headers(payload)
+                    self.send_json(status, {"message": message})
+                    return
                 if parsed.path == "/api/retry-missing":
                     result = store.retry_missing(
                         product=payload.get("product"),
@@ -2641,6 +2841,10 @@ def make_handler(store: CaptureStore):
                     return
                 if parsed.path == "/api/subtitles-only":
                     result = store.start_subtitle_download(payload)
+                    self.send_json(200, result)
+                    return
+                if parsed.path == "/api/archive/fanbox":
+                    result = store.start_archive_fanbox(payload)
                     self.send_json(200, result)
                     return
                 if parsed.path == "/api/start-candidate-download":
@@ -2714,6 +2918,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=17888)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--archive-dir", type=Path, default=DEFAULT_ARCHIVE_DIR)
     parser.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", DEFAULT_FFMPEG))
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--burst-ahead", type=int, default=180)
@@ -2725,6 +2930,7 @@ def main() -> int:
     store = CaptureStore(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
+        archive_dir=args.archive_dir,
         ffmpeg=args.ffmpeg,
         workers=args.workers,
         burst_ahead=args.burst_ahead,
@@ -2737,6 +2943,7 @@ def main() -> int:
     print(f"Dashboard: http://{args.host}:{args.port}/", flush=True)
     print(f"Capture endpoint: http://{args.host}:{args.port}/capture", flush=True)
     print(f"Data: {args.data_dir}", flush=True)
+    print(f"Archives: {args.archive_dir}", flush=True)
     server.serve_forever()
     return 0
 

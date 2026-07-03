@@ -11,6 +11,18 @@ function isSubtitleHint(url) {
   return /subtitle|caption|closed.?caption|text.?track|timed.?text|webvtt|cue|\/cc(?:[/?#=&_.-]|$)|[?&]cc=/.test(text);
 }
 
+function isArchiveAuthUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "api.fanbox.cc") return true;
+    if (host === "downloads.fanbox.cc") return true;
+    return host === "fanbox.cc" || host.endsWith(".fanbox.cc");
+  } catch {
+    return false;
+  }
+}
+
 function isLocalServerUrl(url, serverUrl) {
   return url.startsWith(serverUrl) || /^https?:\/\/127\.0\.0\.1:17888\//.test(url) || /^https?:\/\/localhost:17888\//.test(url);
 }
@@ -77,10 +89,28 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   async (details) => {
     const media = isInterestingMedia(details.url);
     const subtitleHint = isSubtitleHint(details.url);
-    if (!media && !subtitleHint) return;
+    const archiveAuth = isArchiveAuthUrl(details.url);
+    if (!media && !subtitleHint && !archiveAuth) return;
     const { serverUrl, enabled, discover } = await getServer();
     if (isLocalServerUrl(details.url, serverUrl)) return;
     if (!discover && !enabled) return;
+
+    if (archiveAuth) {
+      fetch(`${serverUrl}/api/archive/headers`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          site: "fanbox",
+          url: details.url,
+          method: details.method || "GET",
+          requestHeaders: details.requestHeaders || [],
+          initiator: details.initiator || "",
+          tabId: details.tabId,
+          timeStamp: details.timeStamp
+        })
+      }).catch(() => {});
+      if (!media && !subtitleHint) return;
+    }
 
     const endpoint = enabled && media ? "capture" : "candidate";
     const reason = subtitleHint && !media ? "subtitle-hint-seen" : (enabled ? "capture-media-seen" : "candidate-media-seen");

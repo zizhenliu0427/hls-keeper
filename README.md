@@ -250,3 +250,73 @@ HLS Keeper 对普通 HLS 最有用。下面情况可能无法完整下载：
 - 源站故意返回空片段或一次性片段。
 - 清晰度切换时不同分辨率切片表不一致。
 - 服务器强制绑定极短期 token、设备指纹、IP 或播放会话。
+
+## Archive module
+
+HLS Keeper now also includes an independent `archive` module for batch downloading
+site attachments. The first adapter is FANBOX ZIP archives.
+
+This module is separate from the HLS capture pipeline:
+
+- HLS logic still handles `.m3u8`, `.ts`, keys, subtitles, and merging.
+- Archive logic handles creator pages, post metadata, attachment filenames, and
+  normal file downloads.
+- Archive jobs appear in the same Dashboard Jobs table.
+
+### FANBOX ZIP archive
+
+Start the local server, open the Dashboard, then use the `Archive: FANBOX ZIP
+attachments` panel.
+
+Fields:
+
+- `creatorId`: for example `dollhouse`.
+- `start page` / `end page`: page range to scan. Leave end blank to continue
+  until FANBOX has no more pages.
+- `output folder`: optional. If blank, files are saved under
+  `archives/fanbox/<creatorId>`.
+- `use saved browser headers first`: enabled by default. With the extension's
+  Discover or Capture switch enabled, opening FANBOX automatically stores recent
+  FANBOX request headers for archive downloads.
+- `headers JSON`: optional override/fallback if automatic header capture is not
+  available, for example `{"cookie":"..."}`.
+- `ZIP only`: enabled by default.
+
+The FANBOX adapter calls `post.info` for each post and uses the original file
+metadata (`name` + `extension`) instead of the UUID download URL, so ZIP files
+keep their real names.
+
+Automatic headers are preferred. Manual `headers JSON` values are merged on top
+of the saved browser headers, so they can override a stale cookie or referer
+without disabling the automatic path.
+
+API example:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:17888/api/archive/fanbox `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"creator_id":"dollhouse","start_page":1,"end_page":10,"workers":4,"request_delay_ms":100,"zip_only":true}'
+```
+
+### Archive TODO
+
+- Generic Archive module: capture and download common archive links or browser
+  requests such as `.zip`, `.rar`, `.7z`, `.tar`, `.tar.gz`, and `.cbz` from
+  ordinary pages. Prefer automatically captured browser headers, with manual
+  headers as a fallback.
+- Generic page ZIP scanner: scan the current page or a submitted URL for direct
+  archive links, resolve relative URLs, preserve useful filenames, and send them
+  to the archive downloader queue.
+- Browser-captured archive queue: when the extension sees an archive download
+  request, save it as a candidate in the Dashboard so it can be downloaded,
+  retried, skipped, or grouped later.
+- Batch image downloader: capture or scan image resources such as `.jpg`,
+  `.jpeg`, `.png`, `.webp`, `.gif`, `.avif`, and `.bmp`; group them by page,
+  title, source site, or user-defined folder rule.
+- Image filename and folder rules: preserve original filenames when available,
+  infer names from page metadata when URLs are opaque, and avoid overwriting by
+  using stable duplicate handling.
+- Shared archive manifest: record source URL, page URL, headers source,
+  original filename, saved path, file size, checksum when practical, and retry
+  status for both archive and image downloads.
