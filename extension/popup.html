@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>HLS Keeper</title>
+  <style>
+    :root { font-family: "Segoe UI", system-ui, sans-serif; color: #1f2430; }
+    * { box-sizing: border-box; }
+    body { margin: 0; width: 380px; background: #eef1f5; }
+    header { padding: 14px 16px 10px; background: #ffffff; border-bottom: 1px solid #d9dee7; }
+    .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
+    .logo { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: #fff; background: #2563eb; font-weight: 800; }
+    .pill { border-radius: 999px; padding: 4px 8px; font-size: 12px; background: #eef2ff; color: #334eac; }
+    main { padding: 12px; display: grid; gap: 10px; }
+    .card { background: #fff; border: 1px solid #dce2eb; border-radius: 8px; padding: 12px; }
+    .row { display: flex; align-items: center; gap: 8px; }
+    .between { justify-content: space-between; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .stat { background: #f7f9fc; border: 1px solid #e3e8f0; border-radius: 6px; padding: 8px; }
+    .label { color: #667085; font-size: 12px; }
+    .value { font-size: 18px; font-weight: 700; margin-top: 2px; }
+    button { border: 1px solid #b8c2d2; border-radius: 6px; background: #fff; padding: 8px 10px; cursor: pointer; font: inherit; }
+    button:hover { background: #f4f7fb; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 700; }
+    button.primary:hover { background: #1d4ed8; }
+    button.danger { color: #b42318; }
+    input[type="text"] { width: 100%; border: 1px solid #c7d0df; border-radius: 6px; padding: 8px; font: 12px Consolas, monospace; }
+    .toggle { display: flex; align-items: center; gap: 8px; }
+    .switch { position: relative; width: 42px; height: 24px; }
+    .switch input { display: none; }
+    .slider { position: absolute; inset: 0; cursor: pointer; background: #c7ccd4; border-radius: 999px; transition: .15s; }
+    .slider:before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: white; border-radius: 50%; transition: .15s; box-shadow: 0 1px 3px #0002; }
+    .switch input:checked + .slider { background: #2563eb; }
+    .switch input:checked + .slider:before { transform: translateX(18px); }
+    .list { display: grid; gap: 8px; max-height: 174px; overflow: auto; }
+    .item { border: 1px solid #e2e7ef; border-radius: 6px; padding: 8px; background: #fbfcfe; }
+    .item-title { font: 12px Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .muted { color: #697586; font-size: 12px; }
+    progress { width: 100%; height: 10px; }
+    footer { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-top: 1px solid #d9dee7; background: #fff; }
+    #toast { min-height: 16px; color: #667085; font-size: 12px; }
+    .ok { color: #107c41; }
+    .warn { color: #9a6700; }
+    .bad { color: #b42318; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="top">
+      <div class="brand"><div class="logo">H</div><div>HLS Keeper</div></div>
+      <div id="connection" class="pill">checking</div>
+    </div>
+  </header>
+  <main>
+    <section class="card">
+      <div class="row between">
+        <label class="toggle">
+          <span class="switch"><input id="discover" type="checkbox"><span class="slider"></span></span>
+          <span>Discover</span>
+        </label>
+        <label class="toggle">
+          <span class="switch"><input id="enabled" type="checkbox"><span class="slider"></span></span>
+          <span>Capture</span>
+        </label>
+      </div>
+      <div style="margin-top:10px">
+        <input id="serverUrl" type="text" title="Local server URL">
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="stat"><div class="label">Candidates</div><div id="candidateCount" class="value">0</div></div>
+      <div class="stat"><div class="label">Jobs</div><div id="jobCount" class="value">0</div></div>
+      <div class="stat"><div class="label">Saved</div><div id="savedCount" class="value">0</div></div>
+    </section>
+
+    <section class="card">
+      <div class="row between" style="margin-bottom:8px">
+        <strong>Downloadable</strong>
+        <button id="refresh">Refresh</button>
+      </div>
+      <div id="candidates" class="list"><div class="muted">No candidates yet.</div></div>
+    </section>
+
+    <section class="card">
+      <div class="row between" style="margin-bottom:8px">
+        <strong>Progress</strong>
+        <span id="speed" class="muted">0 MB/s</span>
+      </div>
+      <div id="jobs" class="list"><div class="muted">No active jobs.</div></div>
+    </section>
+  </main>
+  <footer>
+    <div class="row">
+      <button id="save">Save</button>
+      <button id="start" class="primary">Start</button>
+      <button id="stop" class="danger">Stop</button>
+    </div>
+    <button id="open">Dashboard</button>
+  </footer>
+  <div id="toast" style="padding:0 12px 10px;background:#fff"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "zh-hans": {
+    "後臺": "后台",
+    "影片": "视频"
+  },
+  "zh-hant": {
+    "后台": "後臺",
+    "视频": "影片"
+  },
+  "en-us": {
+    "subtitles": "captions"
+  },
+  "en-gb": {
+    "captions": "subtitles"
+  }
+}

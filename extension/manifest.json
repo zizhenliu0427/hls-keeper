@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "HLS Keeper",
+  "version": "0.1.2",
+  "description": "Capture authorized HLS requests and send them to the local HLS Keeper service.",
+  "permissions": ["webRequest", "alarms", "storage"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:17888/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "HLS Keeper",
+    "default_popup": "popup.html"
+  }
+}
