@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 
-from .archive import FanboxArchiveDownloader, parse_headers_json
+from .archive import FanboxArchiveDownloader, GenericArchiveDownloader, parse_headers_json, scan_page_for_archives
 
 
 APP_NAME = "HLS Keeper"
@@ -30,6 +30,28 @@ DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_ARCHIVE_DIR = ROOT / "archives"
 DEFAULT_FFMPEG = r"C:\ffmpeg\bin\ffmpeg.exe"
 DEFAULT_FFPROBE = r"C:\ffmpeg\bin\ffprobe.exe"
+FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
+TOOLS_FFMPEG_CANDIDATES = (
+    ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe",
+    ROOT / "tools" / "ffmpeg" / "ffmpeg.exe",
+    ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg",
+    ROOT / "tools" / "ffmpeg" / "ffmpeg",
+)
+
+
+def resolve_ffmpeg(preferred: str = "") -> str:
+    """Find ffmpeg: explicit path/env -> project tools folder -> PATH -> legacy default."""
+    if preferred and Path(preferred).exists():
+        return preferred
+    for candidate in TOOLS_FFMPEG_CANDIDATES:
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    if Path(DEFAULT_FFMPEG).exists():
+        return DEFAULT_FFMPEG
+    return preferred or DEFAULT_FFMPEG
 
 MEDIA_RE = re.compile(r"\.(?P<kind>m3u8|ts|key|vtt|srt|ttml|dfxp|ass|ssa)(?:[?#]|$)", re.I)
 JK_SEGMENT_RE = re.compile(r"/v/(?P<product>[^/]+)/(?P<resolution>\d+x\d+)/(?P<name>[^/?#]+\.ts)(?:[?#]|$)", re.I)
@@ -373,6 +395,11 @@ class CaptureStore:
     def opencc_available(self) -> bool:
         return convert_with_opencc("test", "s2t") is not None
 
+    def ffmpeg_status(self) -> dict[str, Any]:
+        path = self.ffmpeg or ""
+        available = bool(path) and (Path(path).exists() or shutil.which(path) is not None)
+        return {"path": path, "available": available, "download_url": FFMPEG_DOWNLOAD_URL}
+
     def subtitle_dictionary_for(self, mode: str) -> dict[str, str]:
         mode = normalize_subtitle_convert_mode(mode)
         if mode == "none" or not self.subtitle_dictionary_path.exists():
@@ -429,6 +456,55 @@ class CaptureStore:
             job.update(updates)
             job["updated_at"] = now()
             self.save_state()
+
+    FINISHED_JOB_STATUSES = {"complete", "failed", "warning"}
+
+    def delete_stream(self, product: str, resolution: str, delete_files: bool = False) -> dict[str, Any]:
+        key = self.stream_key(product, resolution)
+        with self.lock:
+            active = [
+                job_id
+                for job_id, job in self.state.get("jobs", {}).items()
+                if job.get("product") == product
+                and job.get("resolution") == resolution
+                and job.get("status") not in self.FINISHED_JOB_STATUSES
+            ]
+            if active:
+                return {"error": f"active job(s) running for {key}: {', '.join(active)}. Wait for them to finish first."}
+            removed_record = self.state.get("streams", {}).pop(key, None) is not None
+            self.save_state()
+        removed_dir = None
+        if delete_files:
+            target = self.stream_dir(product, resolution)
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+                removed_dir = str(target)
+            parent = target.parent
+            try:
+                if parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+            except OSError:
+                pass
+        self.log_event({"type": "stream-deleted", "key": key, "record_removed": removed_record, "files_deleted": bool(removed_dir)})
+        return {"deleted": key, "record_removed": removed_record, "files_deleted": bool(removed_dir), "removed_dir": removed_dir}
+
+    def delete_candidate(self, product: str, resolution: str) -> dict[str, Any]:
+        key = self.stream_key(product, resolution)
+        with self.lock:
+            removed = self.state.get("candidates", {}).pop(key, None) is not None
+            self.save_state()
+        self.log_event({"type": "candidate-deleted", "key": key, "removed": removed})
+        return {"deleted": key, "removed": removed}
+
+    def clear_finished_jobs(self) -> dict[str, Any]:
+        with self.lock:
+            jobs = self.state.setdefault("jobs", {})
+            removed = [job_id for job_id, job in jobs.items() if job.get("status") in self.FINISHED_JOB_STATUSES]
+            for job_id in removed:
+                jobs.pop(job_id, None)
+            self.save_state()
+        self.log_event({"type": "jobs-cleared", "count": len(removed)})
+        return {"cleared": len(removed)}
 
     def ensure_stream(self, ref: MediaRef) -> dict[str, Any]:
         key = self.stream_key(ref.product, ref.resolution)
@@ -949,6 +1025,7 @@ class CaptureStore:
                 "opencc_available": self.opencc_available(),
                 "dictionary_path": str(self.subtitle_dictionary_path),
             },
+            "ffmpeg": self.ffmpeg_status(),
             "counters": counters,
             "inflight": inflight,
             "last_ping": last_ping,
@@ -1029,6 +1106,97 @@ class CaptureStore:
             if archive_headers.get(site_key, {}).get("headers"):
                 return dict(archive_headers[site_key]["headers"])
         return {}
+
+    def scan_archive_page(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            raise RuntimeError("url is required")
+        headers = dict(payload.get("headers") or {})
+        headers.update(parse_headers_json(payload.get("headers_json")))
+        links = scan_page_for_archives(url, headers=headers)
+        self.log_event({"type": "archive-scan", "url": url, "found": len(links)})
+        return {"url": url, "count": len(links), "links": links}
+
+    def start_archive_generic(self, payload: dict[str, Any]) -> dict[str, Any]:
+        urls = [str(item).strip() for item in (payload.get("urls") or []) if str(item).strip()]
+        if not urls:
+            raise RuntimeError("urls is required (list of direct archive URLs)")
+        referer = str(payload.get("referer") or "").strip()
+        workers = max(1, min(int(payload.get("workers") or 4), 32))
+        request_delay_ms = max(0, min(int(payload.get("request_delay_ms") or 100), 10000))
+        manual_headers = dict(payload.get("headers") or {})
+        manual_headers.update(parse_headers_json(payload.get("headers_json")))
+        output_dir_text = str(payload.get("output_dir") or "").strip()
+        host = urlparse(referer or urls[0]).netloc or "batch"
+        output_dir = Path(output_dir_text).expanduser() if output_dir_text else self.archive_dir / "generic" / safe_name(host)
+
+        job_seed = f"archive-generic|{len(urls)}|{time.time_ns()}"
+        job_id = f"job_{int(time.time())}_{abs(hash(job_seed)) % 1000000:06d}"
+        job = {
+            "id": job_id,
+            "type": "archive-generic",
+            "status": "queued",
+            "product": f"batch/{host}",
+            "resolution": f"{len(urls)} file(s)",
+            "output_dir": str(output_dir),
+            "workers": workers,
+            "request_delay_ms": request_delay_ms,
+            "manual_headers": bool(manual_headers),
+            "created_at": now(),
+            "updated_at": now(),
+            "total": len(urls),
+            "done": 0,
+            "saved": 0,
+            "skipped_existing": 0,
+            "saved_bytes": 0,
+            "failed": 0,
+            "message": "",
+        }
+        with self.lock:
+            self.state.setdefault("jobs", {})[job_id] = job
+            self.save_state()
+        threading.Thread(
+            target=self.run_archive_generic,
+            args=(job_id, urls, output_dir, manual_headers, referer, workers, request_delay_ms),
+            daemon=True,
+        ).start()
+        return job
+
+    def run_archive_generic(
+        self,
+        job_id: str,
+        urls: list[str],
+        output_dir: Path,
+        headers: dict[str, str],
+        referer: str,
+        workers: int,
+        request_delay_ms: int,
+    ) -> None:
+        try:
+            self.update_job(job_id, status="starting", message="Starting batch archive download")
+            downloader = GenericArchiveDownloader(
+                output_root=output_dir,
+                headers=headers,
+                referer=referer,
+                workers=workers,
+                request_delay_ms=request_delay_ms,
+                update=lambda **updates: self.update_job(job_id, **updates),
+            )
+            result = downloader.download_all(urls)
+            status = "complete" if not result["failed"] else "warning"
+            self.update_job(
+                job_id,
+                status=status,
+                done=result["done"],
+                total=result["total"],
+                saved=result["saved"],
+                skipped_existing=result["skipped_existing"],
+                failed=result["failed"],
+                saved_bytes=result["saved_bytes"],
+                message=f"saved {result['saved']}, existing {result['skipped_existing']}, failed {result['failed']} -> {result['output_dir']}",
+            )
+        except Exception as exc:
+            self.update_job(job_id, status="failed", message=str(exc))
 
     def start_archive_fanbox(self, payload: dict[str, Any]) -> dict[str, Any]:
         creator_id = str(payload.get("creator_id") or payload.get("creatorId") or "").strip()
@@ -2321,7 +2489,13 @@ class CaptureStore:
             if found:
                 cmd[0] = found
             else:
-                raise RuntimeError(f"ffmpeg not found: {self.ffmpeg}")
+                segments_dir = self.stream_dir(product, actual_resolution)
+                raise RuntimeError(
+                    f"ffmpeg not found (looked at {self.ffmpeg}, tools/ffmpeg/ and PATH). "
+                    f"Download it from {FFMPEG_DOWNLOAD_URL}, then add it to PATH, place it in tools/ffmpeg/bin/, "
+                    f"or set the FFMPEG environment variable and restart the server. "
+                    f"Your downloaded segments are safe in {segments_dir} if you prefer to merge manually."
+                )
         started = time.time()
         run = subprocess.run(cmd, capture_output=True, text=True)
         result = {
@@ -2354,139 +2528,384 @@ def replace_segment_number(value: str, num: int) -> str:
 
 
 DASHBOARD_HTML = r"""<!doctype html>
-<html lang="zh-CN">
+<html lang="en-AU">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HLS Keeper</title>
+  <title>Web Keeper</title>
   <style>
-    :root { color-scheme: light dark; font-family: "Segoe UI", system-ui, sans-serif; }
-    body { margin: 0; background: #f6f7f9; color: #171a1f; }
-    header { padding: 18px 24px; background: #1f2937; color: white; display: flex; justify-content: space-between; align-items: center; }
-    h1 { font-size: 20px; margin: 0; letter-spacing: 0; }
-    main { padding: 20px 24px 36px; }
-    .stats { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; margin-bottom: 16px; }
-    .stat { background: white; border: 1px solid #d8dde6; border-radius: 6px; padding: 12px; }
-    .label { font-size: 12px; color: #657083; }
-    .value { font-size: 22px; font-weight: 650; margin-top: 4px; }
-    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #d8dde6; }
-    th, td { padding: 9px 10px; border-bottom: 1px solid #e7ebf0; text-align: left; font-size: 13px; vertical-align: top; }
-    th { background: #eef2f7; font-weight: 650; }
-    button, select, input { font: inherit; }
-    button { border: 1px solid #aeb8c7; background: #fff; border-radius: 5px; padding: 6px 9px; cursor: pointer; }
-    button:hover { background: #f2f5f9; }
-    progress { width: 180px; height: 12px; vertical-align: middle; }
-    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
-    .ok { color: #107c41; font-weight: 650; }
-    .warn { color: #9a6700; font-weight: 650; }
-    .bad { color: #b42318; font-weight: 650; }
-    .mono { font-family: Consolas, monospace; font-size: 12px; }
-    .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
-    .notice { display: none; border: 1px solid #f1c36d; background: #fff7e6; color: #6f4e00; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; }
-    .notice.show { display: block; }
-    #log { white-space: pre-wrap; background: #111827; color: #e5e7eb; border-radius: 6px; padding: 12px; margin-top: 14px; min-height: 72px; max-height: 280px; overflow: auto; }
+    :root {
+      color-scheme: light dark;
+      --bg: #f2f4f8; --surface: #ffffff; --surface2: #f7f9fc;
+      --border: #e2e8f0; --border-strong: #c7d2e0;
+      --text: #0f172a; --muted: #64748b;
+      --accent: #2563eb; --accent-hover: #1d4ed8; --accent-soft: #eff4ff;
+      --ok: #15803d; --warn: #9a6700; --bad: #b42318;
+      --ok-soft: #ecfdf3; --warn-soft: #fffaeb; --bad-soft: #fef3f2;
+      --radius: 10px; --shadow: 0 1px 2px rgba(15, 23, 42, .06);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
     @media (prefers-color-scheme: dark) {
-      body { background: #111827; color: #e5e7eb; }
-      .stat, table { background: #182233; border-color: #364252; }
-      th { background: #223047; }
-      td, th { border-bottom-color: #334155; }
-      button { background: #1f2937; color: #e5e7eb; border-color: #4b5563; }
-      button:hover { background: #293548; }
-      .label { color: #aab4c4; }
-      .notice { background: #3a2a12; color: #f8dda0; border-color: #8a651e; }
+      :root {
+        --bg: #0b1220; --surface: #121a2b; --surface2: #182338;
+        --border: #263349; --border-strong: #35455f;
+        --text: #e2e8f0; --muted: #94a3b8;
+        --accent: #3b82f6; --accent-hover: #60a5fa; --accent-soft: #1a2a4a;
+        --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+        --ok-soft: #12291c; --warn-soft: #2e2410; --bad-soft: #331512;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; }
+
+    header {
+      position: sticky; top: 0; z-index: 20;
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .logo {
+      width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+      background: var(--accent); color: #fff; font-weight: 800; font-size: 16px;
+    }
+    .brand h1 { font-size: 16px; margin: 0; }
+    .brand .sub { font-size: 12px; color: var(--muted); }
+    .head-right { display: flex; align-items: center; gap: 10px; }
+
+    .pill {
+      display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12px;
+      background: var(--surface2); border: 1px solid var(--border); color: var(--muted);
+    }
+    .pill.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+    .pill.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+    .pill.bad { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+
+    main { max-width: 1400px; margin: 0 auto; padding: 20px 24px 48px; }
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .stat {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 12px 14px; box-shadow: var(--shadow);
+    }
+    .label { font-size: 12px; color: var(--muted); }
+    .value { font-size: 22px; font-weight: 650; margin-top: 4px; }
+
+    .notice {
+      display: none; border: 1px solid #f1c36d; background: var(--warn-soft); color: var(--warn);
+      border-radius: var(--radius); padding: 10px 14px; margin-bottom: 16px;
+    }
+    .notice.show { display: block; }
+    .notice a { color: inherit; font-weight: 650; }
+
+    .tabs {
+      display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px;
+      overflow-x: auto;
+    }
+    .tab {
+      appearance: none; border: none; background: none; cursor: pointer;
+      padding: 10px 14px; font: inherit; font-weight: 600; color: var(--muted);
+      border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
+      display: flex; align-items: center; gap: 7px;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab:focus { outline: none; }
+    .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+    .badge {
+      min-width: 20px; padding: 1px 6px; border-radius: 999px; text-align: center;
+      font-size: 11px; font-weight: 700; background: var(--surface2); border: 1px solid var(--border); color: var(--muted);
+    }
+    .tab.active .badge { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+    .badge.live { background: var(--accent); border-color: transparent; color: #fff; }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      box-shadow: var(--shadow); margin-bottom: 16px; overflow: hidden;
+    }
+    .card-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+    }
+    .card-head h2 { font-size: 14px; margin: 0; }
+    .card-head .hint { font-size: 12px; color: var(--muted); }
+    .card-body { padding: 14px 16px; }
+
+    details.card > summary {
+      list-style: none; cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 14px;
+      display: flex; align-items: center; gap: 8px; color: var(--text);
+    }
+    details.card > summary::before { content: "\25B8"; color: var(--muted); transition: .12s; }
+    details.card[open] > summary::before { transform: rotate(90deg); }
+    details.card[open] > summary { border-bottom: 1px solid var(--border); }
+    details.card > summary .hint { font-weight: 400; font-size: 12px; color: var(--muted); }
+
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field > span { font-size: 12px; color: var(--muted); }
+    .form-grid { display: grid; gap: 10px 12px; }
+    .options-row { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+
+    input, select, textarea, button { font: inherit; color: inherit; }
+    input[type="text"], input[type="number"], input:not([type]), select, textarea {
+      background: var(--surface2); border: 1px solid var(--border-strong); border-radius: 7px;
+      padding: 7px 9px; width: 100%;
+    }
+    input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+    textarea { font: 12px Consolas, monospace; resize: vertical; }
+    label.check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; }
+    input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
+
+    button {
+      border: 1px solid var(--border-strong); background: var(--surface); border-radius: 7px;
+      padding: 7px 12px; cursor: pointer; font-weight: 550;
+    }
+    button:hover { background: var(--surface2); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 650; }
+    button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    button.mini { padding: 4px 9px; font-size: 12px; border-radius: 6px; }
+    button.danger { color: var(--bad); }
+    button.danger:hover { background: var(--bad-soft); border-color: var(--bad); }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; font-size: 13px; vertical-align: top; }
+    th { background: var(--surface2); font-weight: 650; font-size: 12px; color: var(--muted); white-space: nowrap; position: sticky; top: 0; }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: color-mix(in srgb, var(--surface2) 55%, transparent); }
+    td.empty { text-align: center; color: var(--muted); padding: 26px 12px; }
+
+    progress { width: 160px; height: 10px; vertical-align: middle; accent-color: var(--accent); }
+    .actions { display: flex; gap: 5px; flex-wrap: wrap; }
+    .ok { color: var(--ok); font-weight: 650; }
+    .warn { color: var(--warn); font-weight: 650; }
+    .bad { color: var(--bad); font-weight: 650; }
+    .mono { font-family: Consolas, monospace; font-size: 12px; }
+    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+
+    #log {
+      white-space: pre-wrap; background: #0d1424; color: #cbd5e1; border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 12px 14px; min-height: 72px; max-height: 300px; overflow: auto;
+      font: 12px Consolas, monospace;
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>HLS Keeper</h1>
-    <div id="heartbeat" class="mono">checking...</div>
+    <div class="brand">
+      <div class="logo">W</div>
+      <div>
+        <h1>Web Keeper</h1>
+        <div class="sub">Local capture &amp; archive</div>
+      </div>
+    </div>
+    <div class="head-right">
+      <span id="heartbeat" class="pill mono">checking...</span>
+      <button id="refresh">Refresh</button>
+    </div>
   </header>
   <main>
     <div class="stats">
       <div class="stat"><div class="label">Streams</div><div id="streams" class="value">0</div></div>
-      <div class="stat"><div class="label">Saved</div><div id="saved" class="value">0</div></div>
+      <div class="stat"><div class="label">Saved segments</div><div id="saved" class="value">0</div></div>
       <div class="stat"><div class="label">Failed</div><div id="failed" class="value">0</div></div>
-      <div class="stat"><div class="label">Bad Small</div><div id="badSmall" class="value">0</div></div>
-      <div class="stat"><div class="label">Size</div><div id="size" class="value">0 MB</div></div>
+      <div class="stat"><div class="label">Bad small</div><div id="badSmall" class="value">0</div></div>
+      <div class="stat"><div class="label">Total size</div><div id="size" class="value">0 MB</div></div>
     </div>
-    <div class="toolbar">
-      <button id="refresh">Refresh</button>
-      <button id="retryAll">Retry Missing</button>
-      <span class="label">Strategy: strict = no missing; skip = continuous playback with gaps skipped; fill-skip = fill from lower quality, then skip leftovers.</span>
-    </div>
+    <div id="ffmpegNotice" class="notice"></div>
     <div id="subtitleNotice" class="notice"></div>
-    <section class="stat" style="margin-bottom:16px">
-      <div class="label">Discovered videos</div>
-      <table style="margin-top:8px">
-        <thead><tr><th>Candidate</th><th>Seen</th><th>URLs</th><th>Quality</th><th>Actions</th></tr></thead>
-        <tbody id="candidates"></tbody>
-      </table>
+
+    <nav class="tabs">
+      <button type="button" class="tab active" data-tab="capture">Capture <span id="tabCaptureCount" class="badge">0</span></button>
+      <button type="button" class="tab" data-tab="library">Library <span id="tabLibraryCount" class="badge">0</span></button>
+      <button type="button" class="tab" data-tab="archive">Archive</button>
+      <button type="button" class="tab" data-tab="jobs">Jobs <span id="tabJobsCount" class="badge">0</span></button>
+    </nav>
+
+    <!-- ============ Capture ============ -->
+    <section class="panel active" data-panel="capture">
+      <div class="card">
+        <div class="card-head">
+          <h2>Download options</h2>
+          <span class="hint">Applies to downloads started from this tab.</span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));">
+            <label class="field"><span>Parallel workers</span><input id="directWorkers" type="number" min="1" max="64" value="8"></label>
+            <label class="field"><span>Delay per request (ms)</span><input id="directDelay" type="number" min="0" max="10000" value="0"></label>
+            <label class="field"><span>Subtitle conversion</span>
+              <select id="subtitleConvert">
+                <option value="none">Keep original</option>
+                <option value="zh-hans">Traditional Chinese &#8594; Simplified</option>
+                <option value="zh-hant">Simplified Chinese &#8594; Traditional</option>
+                <option value="en-us">British English &#8594; American</option>
+                <option value="en-gb">American English &#8594; British</option>
+              </select>
+            </label>
+          </div>
+          <div class="options-row" style="margin-top: 12px;">
+            <label class="check"><input id="useSavedHeaders" type="checkbox" checked> Use saved browser headers when possible</label>
+            <label class="check"><input id="qualityFallback" type="checkbox" checked> Fall back automatically if the selected quality is missing</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Discovered videos</h2>
+          <span class="hint">Enable Discover in the extension, then play a video in your browser.</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Candidate</th><th>Seen</th><th>Detected media</th><th>Quality</th><th>Actions</th></tr></thead>
+            <tbody id="candidates"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <details class="card">
+        <summary>Direct URL download <span class="hint">&#8212; advanced fallback when discovery misses a stream</span></summary>
+        <div class="card-body">
+          <div class="form-grid" style="grid-template-columns: 2fr 1fr 1fr;">
+            <label class="field"><span>m3u8 or subtitle URL</span><input id="directUrl" placeholder="https://.../index.m3u8"></label>
+            <label class="field"><span>Video ID</span><input id="directProduct" placeholder="e.g. my-video"></label>
+            <label class="field"><span>Preferred quality</span><input id="directResolution" placeholder="e.g. 1920x1080,1280x720"></label>
+          </div>
+          <label class="field" style="margin-top: 10px;"><span>Headers JSON (optional)</span>
+            <textarea id="directHeaders" placeholder='{"referer": "https://..."}' style="height: 62px;"></textarea>
+          </label>
+          <div class="toolbar" style="margin: 12px 0 0;">
+            <button id="startDirect" class="primary">Start direct download</button>
+            <button id="startSubtitleOnly">Download subtitles only</button>
+          </div>
+        </div>
+      </details>
     </section>
-    <section class="stat" style="margin-bottom:16px">
-      <div class="label">Advanced fallback: direct m3u8 / subtitle URL</div>
-      <div style="display:grid; grid-template-columns: 2fr 120px 120px 90px 100px; gap:8px; margin-top:8px">
-        <input id="directUrl" placeholder="m3u8 URL or subtitle URL">
-        <input id="directProduct" placeholder="video id">
-        <input id="directResolution" placeholder="preferred quality, e.g. 1920x1080 or 1920x1080,1280x720">
-        <input id="directWorkers" type="number" min="1" max="64" value="8" title="Parallel workers">
-        <input id="directDelay" type="number" min="0" max="10000" value="0" title="Delay ms/request">
-      </div>
-      <textarea id="directHeaders" placeholder='optional headers JSON, e.g. {"referer":"https://..."}' style="box-sizing:border-box;width:100%;height:62px;margin-top:8px;font:12px Consolas,monospace"></textarea>
-      <div class="toolbar" style="margin:8px 0 0">
-        <label><input id="useSavedHeaders" type="checkbox" checked> use saved browser headers when possible</label>
-        <label><input id="qualityFallback" type="checkbox" checked> auto fallback if selected quality is missing</label>
-        <label>CC convert
-          <select id="subtitleConvert">
-            <option value="none">keep original</option>
-            <option value="zh-hans">Traditional Chinese -> Simplified</option>
-            <option value="zh-hant">Simplified Chinese -> Traditional</option>
-            <option value="en-us">British English -> American</option>
-            <option value="en-gb">American English -> British</option>
-          </select>
-        </label>
-        <button id="startDirect">Start direct download</button>
-        <button id="startSubtitleOnly">Download CC only</button>
-      </div>
-    </section>
-    <section class="stat" style="margin-bottom:16px">
-      <div class="label">Archive: FANBOX ZIP attachments</div>
-      <div style="display:grid; grid-template-columns: 160px 90px 90px 90px 90px 110px; gap:8px; margin-top:8px">
-        <input id="archiveCreator" placeholder="creatorId, e.g. dollhouse">
-        <input id="archiveStartPage" type="number" min="1" value="1" title="Start page">
-        <input id="archiveEndPage" type="number" min="1" placeholder="end" title="End page, blank = all">
-        <input id="archiveWorkers" type="number" min="1" max="32" value="4" title="Parallel workers">
-        <input id="archiveDelay" type="number" min="0" max="10000" value="100" title="Delay ms/request">
-        <label><input id="archiveZipOnly" type="checkbox" checked> ZIP only</label>
-      </div>
-      <input id="archiveOutput" placeholder="optional output folder, blank = archives/fanbox/<creatorId>" style="box-sizing:border-box;width:100%;margin-top:8px">
-      <textarea id="archiveHeaders" placeholder='optional headers JSON override/fallback, e.g. {"cookie":"FANBOXSESSID=..."}' style="box-sizing:border-box;width:100%;height:62px;margin-top:8px;font:12px Consolas,monospace"></textarea>
-      <div class="toolbar" style="margin:8px 0 0">
-        <label><input id="archiveUseSavedHeaders" type="checkbox" checked> use saved browser headers first</label>
-        <button id="startArchiveFanbox">Start FANBOX archive</button>
-        <span id="archiveHeaderStatus" class="label">Open FANBOX with Discover enabled to capture headers automatically.</span>
+
+    <!-- ============ Library ============ -->
+    <section class="panel" data-panel="library">
+      <div class="card">
+        <div class="card-head">
+          <h2>Captured streams</h2>
+          <div class="toolbar" style="margin: 0;">
+            <label class="check" title="When ticked, Delete also removes the downloaded segment files from disk"><input id="deleteFiles" type="checkbox"> Delete files on disk too</label>
+            <button id="retryAll">Retry all missing</button>
+          </div>
+        </div>
+        <div class="card-body" style="padding-bottom: 10px;">
+          <span class="hint" style="font-size: 12px; color: var(--muted);">
+            Merge strategies &#8212; strict: fail if any segment is missing &#183; fill-skip: fill gaps from lower quality, then skip leftovers &#183; skip: continuous playback with gaps skipped.
+          </span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Video</th><th>Resolution</th><th>Media</th><th>Files</th><th>Missing</th><th>Subtitles</th><th>Latest</th><th>Size</th><th>Actions</th></tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
       </div>
     </section>
-    <table>
-      <thead>
-        <tr>
-          <th>Video</th><th>Resolution</th><th>Media</th><th>Files</th><th>Missing</th><th>Subtitles</th><th>Latest</th><th>Size</th><th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="rows"></tbody>
-    </table>
-    <h2 style="font-size:16px;margin:18px 0 8px">Jobs</h2>
-    <table>
-      <thead>
-        <tr><th>Job</th><th>Status</th><th>Target</th><th>Quality</th><th>Progress</th><th>Speed Setting</th><th>Subtitles</th><th>Message</th></tr>
-      </thead>
-      <tbody id="jobs"></tbody>
-    </table>
-    <div id="log">Ready.</div>
+
+    <!-- ============ Archive ============ -->
+    <section class="panel" data-panel="archive">
+      <div class="card">
+        <div class="card-head">
+          <h2>Batch archive download</h2>
+          <span class="hint">Scan a page for .zip / .rar / .7z / .tar / .cbz links, or paste direct URLs.</span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid" style="grid-template-columns: 1fr auto; align-items: end;">
+            <label class="field"><span>Page URL to scan</span><input id="scanUrl" placeholder="https://example.com/downloads"></label>
+            <button id="scanPage" class="primary">Scan page</button>
+          </div>
+          <div id="scanResults" style="margin-top: 10px;"></div>
+          <label class="field" style="margin-top: 10px;"><span>Direct archive URLs (optional, one per line)</span>
+            <textarea id="archiveUrls" placeholder="https://example.com/file1.zip" style="height: 62px;"></textarea>
+          </label>
+          <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 10px;">
+            <label class="field"><span>Parallel workers</span><input id="genericWorkers" type="number" min="1" max="32" value="4"></label>
+            <label class="field"><span>Delay per request (ms)</span><input id="genericDelay" type="number" min="0" max="10000" value="100"></label>
+            <label class="field"><span>Output folder (optional)</span><input id="genericOutput" placeholder="blank = archives/generic/&lt;site&gt;"></label>
+          </div>
+          <label class="field" style="margin-top: 10px;"><span>Headers JSON (optional, e.g. cookies)</span>
+            <textarea id="genericHeaders" placeholder='{"cookie": "..."}' style="height: 48px;"></textarea>
+          </label>
+          <div class="toolbar" style="margin: 12px 0 0;">
+            <button id="startArchiveGeneric" class="primary">Start batch download</button>
+            <span id="scanStatus" class="hint"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h2>FANBOX ZIP attachments</h2>
+          <span id="archiveHeaderStatus" class="hint">Open FANBOX with Discover enabled to capture headers automatically.</span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));">
+            <label class="field"><span>Creator ID</span><input id="archiveCreator" placeholder="e.g. dollhouse"></label>
+            <label class="field"><span>Start page</span><input id="archiveStartPage" type="number" min="1" value="1"></label>
+            <label class="field"><span>End page</span><input id="archiveEndPage" type="number" min="1" placeholder="blank = all"></label>
+            <label class="field"><span>Parallel workers</span><input id="archiveWorkers" type="number" min="1" max="32" value="4"></label>
+            <label class="field"><span>Delay per request (ms)</span><input id="archiveDelay" type="number" min="0" max="10000" value="100"></label>
+          </div>
+          <label class="field" style="margin-top: 10px;"><span>Output folder (optional, blank = archives/fanbox/&lt;creatorId&gt;)</span>
+            <input id="archiveOutput" placeholder="e.g. D:\archives\fanbox">
+          </label>
+          <label class="field" style="margin-top: 10px;"><span>Headers JSON override (optional)</span>
+            <textarea id="archiveHeaders" placeholder='{"cookie": "FANBOXSESSID=..."}' style="height: 62px;"></textarea>
+          </label>
+          <div class="options-row" style="margin-top: 12px;">
+            <label class="check"><input id="archiveZipOnly" type="checkbox" checked> ZIP files only</label>
+            <label class="check"><input id="archiveUseSavedHeaders" type="checkbox" checked> Use saved browser headers first</label>
+            <button id="startArchiveFanbox" class="primary">Start FANBOX archive</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Jobs ============ -->
+    <section class="panel" data-panel="jobs">
+      <div class="card">
+        <div class="card-head">
+          <h2>Jobs</h2>
+          <div class="toolbar" style="margin: 0;">
+            <span class="hint">Downloads, merges and archive runs.</span>
+            <button id="clearJobs">Clear finished</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Job</th><th>Status</th><th>Target</th><th>Quality</th><th>Progress</th><th>Speed</th><th>Subtitles</th><th>Message</th></tr>
+            </thead>
+            <tbody id="jobs"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Activity log</h2></div>
+        <div class="card-body"><div id="log">Ready.</div></div>
+      </div>
+    </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
     function log(text) { $("log").textContent = `${new Date().toLocaleTimeString()}  ${text}\n` + $("log").textContent; }
+
+    // ---- tabs ----
+    function showTab(name) {
+      document.querySelectorAll(".tab").forEach(tab => tab.classList.toggle("active", tab.dataset.tab === name));
+      document.querySelectorAll(".panel").forEach(panel => panel.classList.toggle("active", panel.dataset.panel === name));
+      try { localStorage.setItem("wk-tab", name); } catch {}
+    }
+    document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => showTab(tab.dataset.tab)));
+    try { const savedTab = localStorage.getItem("wk-tab"); if (savedTab && document.querySelector(`.panel[data-panel="${savedTab}"]`)) showTab(savedTab); } catch {}
+
     async function api(path, options = {}) {
       const res = await fetch(path, options);
       const text = await res.text();
@@ -2495,36 +2914,32 @@ DASHBOARD_HTML = r"""<!doctype html>
       if (!res.ok) throw new Error(typeof body === "string" ? body : JSON.stringify(body));
       return body;
     }
-    async function refresh() {
-      const status = await api("/api/status");
-      $("streams").textContent = status.streams.length;
-      $("saved").textContent = status.counters.saved || 0;
-      $("failed").textContent = status.counters.failed || 0;
-      $("badSmall").textContent = status.counters.bad_small || 0;
-      $("size").textContent = `${status.total_mb} MB`;
-      const ping = status.last_ping;
-      $("heartbeat").textContent = ping ? `${ping.reason} ${new Date(ping.server_time * 1000).toLocaleTimeString()}` : "no extension ping";
-      const latestCcJob = (status.jobs || []).find(job => String(job.type || "").includes("subtitle"));
-      const shortCcJob = latestCcJob && latestCcJob.status === "warning" && String(latestCcJob.message || "").toLowerCase().includes("cc looks short") ? latestCcJob : null;
-      const fanboxHeaders = (status.archive_headers || {}).fanbox || null;
-      if (fanboxHeaders && fanboxHeaders.updated_at) {
-        $("archiveHeaderStatus").textContent = `saved FANBOX headers: ${fanboxHeaders.host || "fanbox"} ${new Date(fanboxHeaders.updated_at * 1000).toLocaleTimeString()}`;
-      } else {
-        $("archiveHeaderStatus").textContent = "Open FANBOX with Discover enabled to capture headers automatically.";
-      }
-      const subtitleNotice = $("subtitleNotice");
-      if (shortCcJob) {
-        subtitleNotice.classList.add("show");
-        subtitleNotice.textContent = `CC subtitle looks shorter than expected for ${shortCcJob.product || "this video"}. Refresh the video page, turn CC on, play a few seconds, then click Download CC only again. Existing longer subtitle was kept.`;
-      } else {
-        subtitleNotice.classList.remove("show");
-        subtitleNotice.textContent = "";
-      }
-      const rows = $("rows");
-      rows.innerHTML = "";
+
+    const snapshots = { candidates: "", streams: "", jobs: "" };
+
+    // ---- batch archive scan ----
+    let scanLinks = [];
+    function renderScanResults() {
+      const box = $("scanResults");
+      if (!scanLinks.length) { box.innerHTML = ""; return; }
+      const rows = scanLinks.map((link, index) => `
+        <label class="check" style="display: flex; align-items: flex-start; padding: 4px 0;">
+          <input type="checkbox" data-scan-index="${index}" checked>
+          <span style="overflow-wrap: anywhere;"><span class="mono">${link.filename}</span> <span class="label">${link.extension} &#183; ${link.url}</span></span>
+        </label>`).join("");
+      box.innerHTML = `
+        <div class="label" style="margin-bottom: 4px;">Found ${scanLinks.length} archive link(s) &#8212; untick any you do not want:</div>
+        <div style="max-height: 220px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px;">${rows}</div>`;
+    }
+
+    function renderCandidates(list) {
       const candidates = $("candidates");
       candidates.innerHTML = "";
-      for (const item of status.candidates || []) {
+      if (!list.length) {
+        candidates.innerHTML = '<tr><td class="empty" colspan="5">Nothing discovered yet. Enable Discover in the extension and play a video.</td></tr>';
+        return;
+      }
+      for (const item of list) {
         const variants = item.variants || [];
         const subtitleCount = item.subtitle_urls ? Object.keys(item.subtitle_urls).length : 0;
         const subtitleHintCount = item.subtitle_hints ? Object.keys(item.subtitle_hints).length : 0;
@@ -2545,18 +2960,28 @@ DASHBOARD_HTML = r"""<!doctype html>
           <td class="mono">${urlBadges || "none"}<br><span class="label">${subtitleCount || subtitleHintCount ? "CC candidate detected" : "no CC detected"}</span></td>
           <td><select multiple size="${Math.min(Math.max(variants.length || 1, 1), 4)}" data-quality-for="${item.product}/${item.resolution}">${qualityOptions}</select><br><span class="label">Ctrl/Shift for multiple</span></td>
           <td><div class="actions">
-            <button data-action="candidate-download" data-product="${item.product}" data-resolution="${item.resolution}">Direct download</button>
-            <button data-action="candidate-subtitles" data-product="${item.product}" data-resolution="${item.resolution}">Download CC only</button>
+            <button class="mini primary" data-action="candidate-download" data-product="${item.product}" data-resolution="${item.resolution}">Download</button>
+            <button class="mini" data-action="candidate-subtitles" data-product="${item.product}" data-resolution="${item.resolution}">Subtitles only</button>
+            <button class="mini danger" data-action="delete-candidate" data-product="${item.product}" data-resolution="${item.resolution}">Remove</button>
           </div></td>`;
         candidates.appendChild(tr);
       }
-      for (const row of status.streams) {
+    }
+
+    function renderStreams(list) {
+      const rows = $("rows");
+      rows.innerHTML = "";
+      if (!list.length) {
+        rows.innerHTML = '<tr><td class="empty" colspan="9">No captured streams yet.</td></tr>';
+        return;
+      }
+      for (const row of list) {
         const complete = row.missing_count === 0 && row.files > 0;
         const media = row.media_info || {};
-        const tr = document.createElement("tr");
         const latestSubtitle = row.latest_subtitle || {};
         const subtitleMinutes = latestSubtitle.last_seconds ? `${Math.round(latestSubtitle.last_seconds / 60)}m` : "";
         const subtitleDetail = latestSubtitle.name ? `${latestSubtitle.name}${subtitleMinutes ? " | " + subtitleMinutes : ""}${latestSubtitle.cue_count ? " | " + latestSubtitle.cue_count + " cues" : ""}` : "";
+        const tr = document.createElement("tr");
         tr.innerHTML = `
           <td class="mono">${row.product}</td>
           <td>${row.resolution}</td>
@@ -2567,19 +2992,27 @@ DASHBOARD_HTML = r"""<!doctype html>
           <td class="mono">${row.last_segment || ""}<br>${row.latest_age_seconds == null ? "" : row.latest_age_seconds + "s ago"}</td>
           <td>${row.mb} MB</td>
           <td><div class="actions">
-            <button data-action="retry" data-product="${row.product}" data-resolution="${row.resolution}">Retry</button>
-            <button data-action="merge-strict" data-product="${row.product}" data-resolution="${row.resolution}">Merge strict</button>
-            <button data-action="merge-fill" data-product="${row.product}" data-resolution="${row.resolution}">Merge fill-skip</button>
-            <button data-action="merge-skip" data-product="${row.product}" data-resolution="${row.resolution}">Merge skip</button>
-            <button data-action="open-subtitles" data-product="${row.product}" data-resolution="${row.resolution}">Open CC folder</button>
-            <button data-action="convert-subtitles" data-product="${row.product}" data-resolution="${row.resolution}">Convert CC</button>
-            <button data-action="export-player-subtitle" data-product="${row.product}" data-resolution="${row.resolution}">Export sidecar CC</button>
+            <button class="mini" data-action="retry" data-product="${row.product}" data-resolution="${row.resolution}">Retry</button>
+            <button class="mini" data-action="merge-strict" data-product="${row.product}" data-resolution="${row.resolution}">Merge strict</button>
+            <button class="mini" data-action="merge-fill" data-product="${row.product}" data-resolution="${row.resolution}">Merge fill-skip</button>
+            <button class="mini" data-action="merge-skip" data-product="${row.product}" data-resolution="${row.resolution}">Merge skip</button>
+            <button class="mini" data-action="open-subtitles" data-product="${row.product}" data-resolution="${row.resolution}">CC folder</button>
+            <button class="mini" data-action="convert-subtitles" data-product="${row.product}" data-resolution="${row.resolution}">Convert CC</button>
+            <button class="mini" data-action="export-player-subtitle" data-product="${row.product}" data-resolution="${row.resolution}">Export CC</button>
+            <button class="mini danger" data-action="delete-stream" data-product="${row.product}" data-resolution="${row.resolution}">Delete</button>
           </div></td>`;
         rows.appendChild(tr);
       }
+    }
+
+    function renderJobs(list) {
       const jobs = $("jobs");
       jobs.innerHTML = "";
-      for (const job of status.jobs || []) {
+      if (!list.length) {
+        jobs.innerHTML = '<tr><td class="empty" colspan="8">No jobs yet.</td></tr>';
+        return;
+      }
+      for (const job of list) {
         const total = job.total || 0;
         const done = job.done || 0;
         const progressMax = Math.max(total, done, 1);
@@ -2587,17 +3020,18 @@ DASHBOARD_HTML = r"""<!doctype html>
         const mb = ((job.saved_bytes || 0) / 1024 / 1024).toFixed(1);
         const eta = job.eta_seconds == null ? "" : `${Math.floor(job.eta_seconds / 60)}m ${Math.round(job.eta_seconds % 60)}s`;
         const hasSubtitles = (job.subtitle_tracks || []).length > 0;
+        const statusClass = job.status === "complete" ? "ok" : job.status === "failed" ? "bad" : "warn";
         const jobActions = (job.status === "complete" || (job.status === "warning" && hasSubtitles))
-          ? `<div class="actions">
-              <button data-action="open-subtitles" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Open folder</button>
-              ${hasSubtitles ? `<button data-action="convert-subtitles" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Convert CC</button>` : ""}
-              ${hasSubtitles ? `<button data-action="export-player-subtitle" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Export sidecar CC</button>` : ""}
+          ? `<div class="actions" style="margin-top: 4px;">
+              <button class="mini" data-action="open-subtitles" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Open folder</button>
+              ${hasSubtitles ? `<button class="mini" data-action="convert-subtitles" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Convert CC</button>` : ""}
+              ${hasSubtitles ? `<button class="mini" data-action="export-player-subtitle" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Export CC</button>` : ""}
             </div>`
           : "";
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td class="mono">${job.id || ""}<br>${job.type || ""}</td>
-          <td class="${job.status === "complete" ? "ok" : job.status === "failed" ? "bad" : "warn"}">${job.status || ""}</td>
+          <td><span class="pill ${statusClass}">${job.status || ""}</span></td>
           <td class="mono">${job.product || ""}<br>${job.resolution || ""}</td>
           <td>requested ${job.requested_resolution || job.preferred_resolution || "auto"}<br>chosen ${job.chosen_resolution || job.resolution || ""}${job.fallback_from ? `<br><span class="warn">fallback from ${job.fallback_from}</span>` : ""}</td>
           <td><progress value="${Math.min(done, progressMax)}" max="${progressMax}"></progress> ${pct}%<br>${done}/${total}<br><span class="label">saved ${job.saved || 0}, existing ${job.skipped_existing || 0}, failed ${job.failed || 0}, small ${job.bad_small || 0}</span></td>
@@ -2607,14 +3041,76 @@ DASHBOARD_HTML = r"""<!doctype html>
         jobs.appendChild(tr);
       }
     }
+
+    async function refresh() {
+      const status = await api("/api/status");
+      $("streams").textContent = status.streams.length;
+      $("saved").textContent = status.counters.saved || 0;
+      $("failed").textContent = status.counters.failed || 0;
+      $("badSmall").textContent = status.counters.bad_small || 0;
+      $("size").textContent = `${status.total_mb} MB`;
+      const ping = status.last_ping;
+      const heartbeat = $("heartbeat");
+      heartbeat.textContent = ping ? `${ping.reason} ${new Date(ping.server_time * 1000).toLocaleTimeString()}` : "no extension ping";
+      heartbeat.className = ping ? "pill mono ok" : "pill mono";
+
+      const candidateList = status.candidates || [];
+      const jobList = status.jobs || [];
+      const activeJobs = jobList.filter(job => !["complete", "failed"].includes(job.status)).length;
+      $("tabCaptureCount").textContent = candidateList.length;
+      $("tabLibraryCount").textContent = status.streams.length;
+      const jobBadge = $("tabJobsCount");
+      jobBadge.textContent = activeJobs ? activeJobs : jobList.length;
+      jobBadge.className = activeJobs ? "badge live" : "badge";
+
+      const latestCcJob = jobList.find(job => String(job.type || "").includes("subtitle"));
+      const shortCcJob = latestCcJob && latestCcJob.status === "warning" && String(latestCcJob.message || "").toLowerCase().includes("cc looks short") ? latestCcJob : null;
+      const fanboxHeaders = (status.archive_headers || {}).fanbox || null;
+      if (fanboxHeaders && fanboxHeaders.updated_at) {
+        $("archiveHeaderStatus").textContent = `Saved FANBOX headers: ${fanboxHeaders.host || "fanbox"} ${new Date(fanboxHeaders.updated_at * 1000).toLocaleTimeString()}`;
+      } else {
+        $("archiveHeaderStatus").textContent = "Open FANBOX with Discover enabled to capture headers automatically.";
+      }
+      const ffmpegInfo = status.ffmpeg || null;
+      const ffmpegNotice = $("ffmpegNotice");
+      if (ffmpegInfo && !ffmpegInfo.available) {
+        ffmpegNotice.classList.add("show");
+        ffmpegNotice.innerHTML = `ffmpeg was not found, so merging segments to MP4 will fail. <a href="${ffmpegInfo.download_url}" target="_blank" rel="noreferrer">Download ffmpeg</a>, then either add it to PATH, place it in <span class="mono">tools\\ffmpeg\\bin\\</span> inside the project, or set the <span class="mono">FFMPEG</span> environment variable &#8212; then restart the server. Downloaded segments are kept either way, so you can also merge manually later.`;
+      } else {
+        ffmpegNotice.classList.remove("show");
+        ffmpegNotice.innerHTML = "";
+      }
+      const subtitleNotice = $("subtitleNotice");
+      if (shortCcJob) {
+        subtitleNotice.classList.add("show");
+        subtitleNotice.textContent = `CC subtitle looks shorter than expected for ${shortCcJob.product || "this video"}. Refresh the video page, turn CC on, play a few seconds, then click Subtitles only again. The existing longer subtitle was kept.`;
+      } else {
+        subtitleNotice.classList.remove("show");
+        subtitleNotice.textContent = "";
+      }
+
+      const candSnap = JSON.stringify(candidateList);
+      if (candSnap !== snapshots.candidates) { snapshots.candidates = candSnap; renderCandidates(candidateList); }
+      const streamSnap = JSON.stringify(status.streams);
+      if (streamSnap !== snapshots.streams) { snapshots.streams = streamSnap; renderStreams(status.streams); }
+      const jobSnap = JSON.stringify(jobList);
+      if (jobSnap !== snapshots.jobs) { snapshots.jobs = jobSnap; renderJobs(jobList); }
+    }
+
     document.addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button");
       if (!btn) return;
+      if (btn.classList.contains("tab")) return;
       try {
         if (btn.id === "refresh") return refresh();
         if (btn.id === "retryAll") {
           const result = await api("/api/retry-missing", { method: "POST", headers: {"content-type":"application/json"}, body: "{}" });
           log(`retry queued ${result.queued}`);
+          return refresh();
+        }
+        if (btn.id === "clearJobs") {
+          const result = await api("/api/clear-jobs", { method: "POST", headers: {"content-type":"application/json"}, body: "{}" });
+          log(`cleared ${result.cleared} finished job(s)`);
           return refresh();
         }
         if (btn.id === "startArchiveFanbox") {
@@ -2634,6 +3130,37 @@ DASHBOARD_HTML = r"""<!doctype html>
             })
           });
           log(`archive job started: ${result.id}`);
+          return refresh();
+        }
+        if (btn.id === "scanPage") {
+          const url = $("scanUrl").value.trim();
+          if (!url) { log("enter a page URL to scan first"); return; }
+          $("scanStatus").textContent = "scanning...";
+          const result = await api("/api/archive/scan", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({url, headers_json: $("genericHeaders").value.trim()}) });
+          scanLinks = result.links || [];
+          renderScanResults();
+          $("scanStatus").textContent = `found ${result.count} archive link(s)`;
+          log(`scan found ${result.count} archive link(s) on ${url}`);
+          return;
+        }
+        if (btn.id === "startArchiveGeneric") {
+          const ticked = Array.from(document.querySelectorAll('#scanResults input[data-scan-index]:checked')).map(box => scanLinks[Number(box.dataset.scanIndex)].url);
+          const manual = $("archiveUrls").value.split("\n").map(x => x.trim()).filter(Boolean);
+          const urls = [...new Set([...ticked, ...manual])];
+          if (!urls.length) { log("no URLs to download: scan a page or paste direct URLs first"); return; }
+          const result = await api("/api/archive/generic", {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({
+              urls,
+              referer: $("scanUrl").value.trim(),
+              workers: Number($("genericWorkers").value || 4),
+              request_delay_ms: Number($("genericDelay").value || 100),
+              output_dir: $("genericOutput").value.trim(),
+              headers_json: $("genericHeaders").value.trim()
+            })
+          });
+          log(`batch archive job started: ${result.id} (${urls.length} file(s))`);
           return refresh();
         }
         if (btn.id === "startDirect") {
@@ -2680,6 +3207,19 @@ DASHBOARD_HTML = r"""<!doctype html>
           const result = await api("/api/retry-missing", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution}) });
           log(`${product}/${resolution} retry queued ${result.queued}`);
         }
+        if (btn.dataset.action === "delete-stream") {
+          const withFiles = $("deleteFiles").checked;
+          const message = withFiles
+            ? `Delete ${product}/${resolution} AND its downloaded files on disk? This cannot be undone.`
+            : `Delete the record for ${product}/${resolution}? Downloaded files on disk are kept.`;
+          if (!window.confirm(message)) return;
+          const result = await api("/api/delete-stream", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution, delete_files: withFiles}) });
+          log(`deleted ${result.deleted}${result.files_deleted ? " (files removed from disk)" : " (files kept)"}`);
+        }
+        if (btn.dataset.action === "delete-candidate") {
+          const result = await api("/api/delete-candidate", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution}) });
+          log(`removed candidate ${result.deleted}`);
+        }
         if (btn.dataset.action === "candidate-download") {
           const select = document.querySelector(`select[data-quality-for="${product}/${resolution}"]`);
           const preferred_resolutions = select ? Array.from(select.selectedOptions).map(option => option.value).filter(Boolean) : [resolution];
@@ -2701,7 +3241,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         if (btn.dataset.action === "convert-subtitles") {
           const mode = $("subtitleConvert").value;
           if (mode === "none") {
-            log("choose a CC convert mode first, e.g. Traditional Chinese -> Simplified");
+            log("choose a subtitle conversion mode first (Capture tab, Download options)");
             return;
           }
           const result = await api("/api/convert-subtitles", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution, mode}) });
@@ -2735,8 +3275,8 @@ DASHBOARD_HTML = r"""<!doctype html>
         log(`ERROR ${err.message}`);
       }
     });
-    refresh();
-    setInterval(refresh, 1000);
+    refresh().catch(err => log(`ERROR ${err.message}`));
+    setInterval(() => refresh().catch(() => {}), 1000);
   </script>
 </body>
 </html>
@@ -2824,6 +3364,24 @@ def make_handler(store: CaptureStore):
                     )
                     self.send_json(200, result)
                     return
+                if parsed.path == "/api/delete-stream":
+                    result = store.delete_stream(
+                        product=str(payload.get("product") or ""),
+                        resolution=str(payload.get("resolution") or ""),
+                        delete_files=bool(payload.get("delete_files")),
+                    )
+                    self.send_json(409 if result.get("error") else 200, result)
+                    return
+                if parsed.path == "/api/delete-candidate":
+                    result = store.delete_candidate(
+                        product=str(payload.get("product") or ""),
+                        resolution=str(payload.get("resolution") or ""),
+                    )
+                    self.send_json(200, result)
+                    return
+                if parsed.path == "/api/clear-jobs":
+                    self.send_json(200, store.clear_finished_jobs())
+                    return
                 if parsed.path == "/api/direct-download":
                     preferred_resolutions = payload.get("preferred_resolutions") or []
                     if preferred_resolutions:
@@ -2846,6 +3404,12 @@ def make_handler(store: CaptureStore):
                 if parsed.path == "/api/archive/fanbox":
                     result = store.start_archive_fanbox(payload)
                     self.send_json(200, result)
+                    return
+                if parsed.path == "/api/archive/scan":
+                    self.send_json(200, store.scan_archive_page(payload))
+                    return
+                if parsed.path == "/api/archive/generic":
+                    self.send_json(200, store.start_archive_generic(payload))
                     return
                 if parsed.path == "/api/start-candidate-download":
                     preferred_resolutions = payload.get("preferred_resolutions") or [payload.get("preferred_resolution") or ""]
@@ -2919,7 +3483,7 @@ def main() -> int:
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--archive-dir", type=Path, default=DEFAULT_ARCHIVE_DIR)
-    parser.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", DEFAULT_FFMPEG))
+    parser.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", ""))
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--burst-ahead", type=int, default=180)
     parser.add_argument("--backfill", type=int, default=3)
@@ -2931,7 +3495,7 @@ def main() -> int:
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         archive_dir=args.archive_dir,
-        ffmpeg=args.ffmpeg,
+        ffmpeg=resolve_ffmpeg(args.ffmpeg),
         workers=args.workers,
         burst_ahead=args.burst_ahead,
         backfill=args.backfill,

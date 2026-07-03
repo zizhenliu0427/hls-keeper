@@ -8,7 +8,7 @@ import re
 import shutil
 import time
 from typing import Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urljoin, urlparse
 import zipfile
 
 import requests
@@ -16,6 +16,9 @@ import requests
 
 FANBOX_API = "https://api.fanbox.cc"
 ZIP_EXTENSIONS = {"zip"}
+ARCHIVE_EXTENSIONS = {"zip", "rar", "7z", "tar", "gz", "tgz", "cbz", "bz2", "xz"}
+LINK_ATTR_RE = re.compile(r"""(?:href|src|data-href|data-url|data-download-url)\s*=\s*["']([^"'<>]+)["']""", re.I)
+CONTENT_DISPOSITION_RE = re.compile(r"""filename\*?=(?:UTF-8'')?["']?([^"';]+)""", re.I)
 WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -320,6 +323,183 @@ class FanboxArchiveDownloader:
                         message=f"Page {page_number}: {done}/{total}",
                     )
 
+        return {
+            "done": done,
+            "total": total,
+            "saved": saved,
+            "skipped_existing": skipped_existing,
+            "failed": failed,
+            "saved_bytes": saved_bytes,
+            "output_dir": str(root),
+            "manifest": str(manifest_path),
+        }
+
+
+def generic_headers(headers: dict[str, str] | None = None, referer: str = "") -> dict[str, str]:
+    result = {
+        "accept": "*/*",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        ),
+    }
+    if referer:
+        result["referer"] = referer
+    for key, value in (headers or {}).items():
+        if key and value:
+            result[str(key)] = str(value)
+    return result
+
+
+def archive_extension_from_url(url: str) -> str:
+    path = unquote(urlparse(url).path)
+    lower = path.lower()
+    for compound in (".tar.gz", ".tar.bz2", ".tar.xz"):
+        if lower.endswith(compound):
+            return compound.lstrip(".")
+    extension = Path(lower).suffix.lstrip(".")
+    return extension if extension in ARCHIVE_EXTENSIONS else ""
+
+
+def filename_from_url(url: str, fallback: str = "download.bin") -> str:
+    name = unquote(Path(urlparse(url).path).name)
+    return safe_filename(name, fallback=fallback) if name else fallback
+
+
+def filename_from_response(response: requests.Response) -> str:
+    disposition = response.headers.get("content-disposition") or ""
+    match = CONTENT_DISPOSITION_RE.search(disposition)
+    if match:
+        return safe_filename(unquote(match.group(1)).strip())
+    return ""
+
+
+def scan_page_for_archives(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> list[dict[str, Any]]:
+    session = requests.Session()
+    session.headers.update(generic_headers(headers, referer=url))
+    response = session.get(url, timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError(f"scan HTTP {response.status_code}")
+    seen: set[str] = set()
+    links: list[dict[str, Any]] = []
+    for raw in LINK_ATTR_RE.findall(response.text or ""):
+        absolute = urljoin(response.url, raw.strip())
+        if absolute in seen:
+            continue
+        extension = archive_extension_from_url(absolute)
+        if not extension:
+            continue
+        seen.add(absolute)
+        links.append(
+            {
+                "url": absolute,
+                "filename": filename_from_url(absolute, fallback=f"download.{extension}"),
+                "extension": extension,
+            }
+        )
+    return links
+
+
+class GenericArchiveDownloader:
+    def __init__(
+        self,
+        output_root: Path,
+        headers: dict[str, str] | None = None,
+        referer: str = "",
+        workers: int = 4,
+        request_delay_ms: int = 100,
+        update: Callable[..., None] | None = None,
+    ):
+        self.output_root = output_root
+        self.headers = generic_headers(headers, referer=referer)
+        self.workers = max(1, min(int(workers), 32))
+        self.request_delay_ms = max(0, min(int(request_delay_ms), 10000))
+        self.update = update or (lambda **_: None)
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+
+    def verify_download(self, path: Path, extension: str) -> None:
+        if path.stat().st_size == 0:
+            raise RuntimeError("empty file")
+        if extension in {"zip", "cbz"}:
+            with zipfile.ZipFile(path, "r") as zf:
+                bad_member = zf.testzip()
+                if bad_member is not None:
+                    raise RuntimeError(f"bad ZIP member: {bad_member}")
+
+    def download_one(self, url: str) -> dict[str, Any]:
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        if self.request_delay_ms:
+            time.sleep(self.request_delay_ms / 1000)
+        with self.session.get(url, stream=True, timeout=120) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"download HTTP {response.status_code}: {url}")
+            name = filename_from_response(response) or filename_from_url(url)
+            target = self.output_root / safe_filename(name)
+            content_length = response.headers.get("content-length") or ""
+            expected = int(content_length) if content_length.isdigit() else None
+            if target.exists() and expected is not None and target.stat().st_size == expected:
+                return {
+                    "status": "existing",
+                    "url": url,
+                    "name": target.name,
+                    "path": str(target),
+                    "bytes": target.stat().st_size,
+                }
+            target = unique_path(target)
+            part = target.with_name(f"{target.name}.part")
+            with part.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        if expected is not None and part.stat().st_size != expected:
+            size = part.stat().st_size
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"size mismatch: expected {expected}, got {size}")
+        self.verify_download(part, Path(target.name).suffix.lstrip(".").lower())
+        part.replace(target)
+        return {
+            "status": "saved",
+            "url": url,
+            "name": target.name,
+            "path": str(target),
+            "bytes": target.stat().st_size,
+        }
+
+    def download_all(self, urls: list[str]) -> dict[str, Any]:
+        root = self.output_root
+        root.mkdir(parents=True, exist_ok=True)
+        manifest_path = root / "archive_manifest.jsonl"
+        total = len(urls)
+        done = saved = skipped_existing = failed = 0
+        saved_bytes = 0
+        self.update(status="downloading", total=total, done=0, message=f"Downloading {total} file(s)")
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {executor.submit(self.download_one, url): url for url in urls}
+            for future in as_completed(futures):
+                done += 1
+                try:
+                    result = future.result()
+                    if result["status"] == "existing":
+                        skipped_existing += 1
+                    else:
+                        saved += 1
+                    saved_bytes += int(result.get("bytes") or 0)
+                except Exception as exc:
+                    failed += 1
+                    result = {"status": "failed", "url": futures[future], "error": str(exc)}
+                with manifest_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                self.update(
+                    status="downloading",
+                    done=done,
+                    total=total,
+                    saved=saved,
+                    skipped_existing=skipped_existing,
+                    failed=failed,
+                    saved_bytes=saved_bytes,
+                    message=f"{done}/{total}",
+                )
         return {
             "done": done,
             "total": total,
