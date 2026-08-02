@@ -20,6 +20,8 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 import requests
 
 from .archive import FanboxArchiveDownloader, GenericArchiveDownloader, parse_headers_json, scan_page_for_archives
+from .ledger import DownloadLedger
+from .works import canonical_site
 
 
 APP_NAME = "HLS Keeper"
@@ -381,14 +383,25 @@ class CaptureStore:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.ledger = DownloadLedger(self.data_dir / "downloads.sqlite")
+        self._ledger_variant_cache: dict[tuple[str, str, str], tuple[str, str]] = {}
 
         self.session = requests.Session()
         self.executor = ThreadPoolExecutor(max_workers=workers)
         self.lock = threading.RLock()
         self.inflight: set[str] = set()
+        self._save_dirty = False
+        self._save_interval = 2.0
+        self._last_save_at = 0.0
+        self._streams_cache: list[dict[str, Any]] | None = None
+        self._streams_cache_at = 0.0
+        self._streams_cache_ttl = 20.0
         self.state: dict[str, Any] = self.load_state()
         self.started = time.time()
         self.stop_event = threading.Event()
+        self._prune_state_maps()
+        threading.Thread(target=self._save_loop, daemon=True).start()
+        self._resume_interrupted_direct_jobs()
         if auto_retry_seconds > 0:
             threading.Thread(target=self.retry_loop, daemon=True).start()
 
@@ -427,16 +440,62 @@ class CaptureStore:
             "streams": {},
             "jobs": {},
             "candidates": {},
+            "capture_choices": {},
             "archive_headers": {},
             "subtitle_hints": [],
             "last_ping": None,
             "created_at": now(),
         }
 
-    def save_state(self) -> None:
+    def save_state(self, force: bool = False) -> None:
+        self._save_dirty = True
+        if force:
+            self._flush_state()
+
+    def _flush_state(self) -> None:
+        with self.lock:
+            if not self._save_dirty and self.state_path.exists():
+                return
+            payload = json.dumps(self.state, ensure_ascii=False, separators=(",", ":"))
+            self._save_dirty = False
+            self._last_save_at = time.time()
         tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(payload, encoding="utf-8")
         tmp.replace(self.state_path)
+
+    def _save_loop(self) -> None:
+        while not self.stop_event.is_set():
+            time.sleep(self._save_interval)
+            if self._save_dirty:
+                try:
+                    self._flush_state()
+                except Exception as exc:
+                    print(f"STATE SAVE FAILED: {exc}", flush=True)
+
+    def _trim_map(self, mapping: dict[str, Any] | None, limit: int = 80) -> dict[str, Any]:
+        if not mapping or len(mapping) <= limit:
+            return mapping or {}
+        items = sorted(
+            mapping.items(),
+            key=lambda pair: float((pair[1] or {}).get("updated_at") or 0),
+            reverse=True,
+        )
+        return dict(items[:limit])
+
+    def _prune_state_maps(self) -> None:
+        with self.lock:
+            changed = False
+            for stream in self.state.get("streams", {}).values():
+                failures = stream.get("failures")
+                bad_small = stream.get("bad_small")
+                trimmed_failures = self._trim_map(failures if isinstance(failures, dict) else {})
+                trimmed_bad = self._trim_map(bad_small if isinstance(bad_small, dict) else {})
+                if failures != trimmed_failures or bad_small != trimmed_bad:
+                    stream["failures"] = trimmed_failures
+                    stream["bad_small"] = trimmed_bad
+                    changed = True
+            if changed:
+                self.save_state(force=True)
 
     def log_event(self, event: dict[str, Any]) -> None:
         event["time"] = now()
@@ -449,6 +508,56 @@ class CaptureStore:
     def stream_dir(self, product: str, resolution: str) -> Path:
         return self.capture_dir / product / resolution
 
+    def ensure_ledger_variant(
+        self,
+        ref: MediaRef,
+        *,
+        source_page_url: str = "",
+        selected: bool | None = None,
+        status: str = "detected",
+    ) -> tuple[str, str]:
+        identity_url = source_page_url or ref.url
+        site = canonical_site(identity_url)
+        cache_key = (site, ref.product, ref.resolution)
+        cached = self._ledger_variant_cache.get(cache_key)
+        if cached and selected is None and status == "detected":
+            return cached
+        work_id = self.ledger.ensure_work(
+            site,
+            ref.product,
+            source_page_url=source_page_url,
+            status=status,
+        )
+        variant_id = self.ledger.ensure_variant(
+            work_id,
+            ref.resolution,
+            playlist_url=ref.url if ref.kind == "m3u8" else "",
+            selected=selected,
+            status=status,
+        )
+        self._ledger_variant_cache[cache_key] = (work_id, variant_id)
+        return work_id, variant_id
+
+    def list_works(self) -> list[dict[str, Any]]:
+        return self.ledger.list_works()
+
+    def reindex_work(self, product: str, resolution: str, site: str = "legacy-local") -> dict[str, Any]:
+        raw_product = str(product or "").strip()
+        raw_resolution = str(resolution or "").strip()
+        if not raw_product or not raw_resolution:
+            raise RuntimeError("product and resolution are required")
+        product = safe_name(raw_product)
+        resolution = safe_name(raw_resolution)
+        if product != raw_product or resolution != raw_resolution:
+            raise RuntimeError("invalid product or resolution")
+        return self.ledger.reconcile_variant_directory(
+            site=(site or "legacy-local").strip().lower(),
+            product_id=product,
+            resolution=resolution,
+            folder=self.stream_dir(product, resolution),
+            min_segment_bytes=self.min_segment_bytes,
+        )
+
     def update_job(self, job_id: str, **updates: Any) -> None:
         with self.lock:
             jobs = self.state.setdefault("jobs", {})
@@ -456,6 +565,45 @@ class CaptureStore:
             job.update(updates)
             job["updated_at"] = now()
             self.save_state()
+
+    def _resume_interrupted_direct_jobs(self) -> None:
+        resumable_statuses = {"queued", "fetching-playlist", "downloading"}
+        with self.lock:
+            pending = [
+                (job_id, dict(job))
+                for job_id, job in self.state.get("jobs", {}).items()
+                if job.get("type") == "direct-download" and job.get("status") in resumable_statuses
+            ]
+            for job_id, job in pending:
+                self.state["jobs"][job_id].update(
+                    {
+                        "status": "resuming",
+                        "message": "Service restarted; resuming saved progress",
+                        "updated_at": now(),
+                    }
+                )
+            if pending:
+                self.save_state()
+        for job_id, job in pending:
+            product = str(job.get("product") or "")
+            resolution = str(job.get("resolution") or "")
+            headers = self.best_headers_for(product, resolution) if product and resolution else {}
+            threading.Thread(
+                target=self.run_direct_download,
+                args=(
+                    job_id,
+                    str(job.get("url") or ""),
+                    headers,
+                    product,
+                    resolution,
+                    str(job.get("preferred_resolution") or ""),
+                    bool(job.get("quality_fallback", True)),
+                    max(1, min(int(job.get("workers") or 8), 64)),
+                    max(0, min(int(job.get("request_delay_ms") or 0), 10000)),
+                    str(job.get("subtitle_convert_mode") or "none"),
+                ),
+                daemon=True,
+            ).start()
 
     FINISHED_JOB_STATUSES = {"complete", "failed", "warning"}
 
@@ -485,6 +633,8 @@ class CaptureStore:
                     parent.rmdir()
             except OSError:
                 pass
+        self._streams_cache = None
+        self._streams_cache_at = 0.0
         self.log_event({"type": "stream-deleted", "key": key, "record_removed": removed_record, "files_deleted": bool(removed_dir)})
         return {"deleted": key, "record_removed": removed_record, "files_deleted": bool(removed_dir), "removed_dir": removed_dir}
 
@@ -505,6 +655,22 @@ class CaptureStore:
             self.save_state()
         self.log_event({"type": "jobs-cleared", "count": len(removed)})
         return {"cleared": len(removed)}
+
+    def delete_job(self, job_id: str) -> dict[str, Any]:
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            raise RuntimeError("job_id is required")
+        with self.lock:
+            jobs = self.state.setdefault("jobs", {})
+            job = jobs.get(job_id)
+            if not job:
+                return {"deleted": job_id, "removed": False}
+            if job.get("status") not in self.FINISHED_JOB_STATUSES:
+                raise RuntimeError("running jobs cannot be removed; wait for the job to finish")
+            jobs.pop(job_id, None)
+            self.save_state()
+        self.log_event({"type": "job-deleted", "job_id": job_id})
+        return {"deleted": job_id, "removed": True}
 
     def ensure_stream(self, ref: MediaRef) -> dict[str, Any]:
         key = self.stream_key(ref.product, ref.resolution)
@@ -546,6 +712,29 @@ class CaptureStore:
             return 204, "ignored"
 
         headers = headers_from_browser(payload.get("requestHeaders", []))
+        source_page_url = str(payload.get("initiator") or "")
+        work_id, variant_id = self.ensure_ledger_variant(
+            ref,
+            source_page_url=source_page_url,
+            selected=True,
+            status="capturing",
+        )
+        session_id = f"browser_{work_id}_{variant_id}"
+        self.ledger.create_session(
+            session_id,
+            work_id,
+            selected_variant_ids=[variant_id],
+            mode="browser-assisted",
+            status="browser-assisted",
+        )
+        if ref.kind in SUBTITLE_KINDS:
+            self.ledger.record_subtitle(
+                work_id,
+                label=ref.name,
+                format=ref.kind,
+                source_url=ref.url,
+                status="detected",
+            )
         request_record = {
             "url": url,
             "headers": headers,
@@ -571,21 +760,36 @@ class CaptureStore:
             self.save_state()
 
         if ref.kind == "ts" and ref.num is not None:
-            self.queue_segment_range(ref, headers)
+            self.queue_segment_range(ref, headers, work_id=work_id, variant_id=variant_id)
         else:
-            self.queue_one(ref, headers)
+            self.queue_one(ref, headers, work_id=work_id, variant_id=variant_id)
         return 200, "queued"
 
-    def queue_segment_range(self, ref: MediaRef, headers: dict[str, str]) -> None:
+    def queue_segment_range(
+        self,
+        ref: MediaRef,
+        headers: dict[str, str],
+        *,
+        work_id: str | None = None,
+        variant_id: str | None = None,
+    ) -> None:
         first = max(0, (ref.num or 0) - self.backfill)
         last = (ref.num or 0) + self.burst_ahead
         for num in range(first, last + 1):
             name = replace_segment_number(ref.name, num)
             url = replace_segment_number(ref.url, num)
             item = MediaRef(ref.product, ref.resolution, name, ref.kind, url, num, ref.width)
-            self.queue_one(item, headers)
+            self.queue_one(item, headers, work_id=work_id, variant_id=variant_id)
 
-    def queue_one(self, ref: MediaRef, headers: dict[str, str], reason: str = "capture") -> None:
+    def queue_one(
+        self,
+        ref: MediaRef,
+        headers: dict[str, str],
+        reason: str = "capture",
+        *,
+        work_id: str | None = None,
+        variant_id: str | None = None,
+    ) -> None:
         dest = self.stream_dir(ref.product, ref.resolution) / ref.name
         dest.parent.mkdir(parents=True, exist_ok=True)
         key = self.stream_key(ref.product, ref.resolution) + "/" + ref.name
@@ -595,11 +799,22 @@ class CaptureStore:
             if key in self.inflight:
                 return
             self.inflight.add(key)
-        self.executor.submit(self.download_one, ref, headers, dest, key, reason)
+        self.executor.submit(self.download_one, ref, headers, dest, key, reason, work_id, variant_id)
 
-    def download_one(self, ref: MediaRef, headers: dict[str, str], dest: Path, key: str, reason: str) -> None:
+    def download_one(
+        self,
+        ref: MediaRef,
+        headers: dict[str, str],
+        dest: Path,
+        key: str,
+        reason: str,
+        work_id: str | None = None,
+        variant_id: str | None = None,
+    ) -> None:
         suffix = ".part" if ref.kind != "ts" else ".ts.part"
         tmp = dest.with_suffix(suffix)
+        if not work_id or not variant_id:
+            work_id, variant_id = self.ensure_ledger_variant(ref, status="capturing")
         try:
             response = self.session.get(ref.url, headers=headers, timeout=30)
             content = response.content
@@ -628,6 +843,26 @@ class CaptureStore:
                 self.save_state()
             print(f"SAVED {key} {len(content)} bytes", flush=True)
             self.log_event({"type": "saved", "key": key, "bytes": len(content), "reason": reason})
+            if ref.kind == "ts" and ref.num is not None:
+                self.ledger.record_segment(
+                    variant_id,
+                    ref.num,
+                    source_url=ref.url,
+                    local_path=str(dest),
+                    actual_bytes=len(content),
+                    status="saved",
+                    increment_attempts=True,
+                    refresh_metrics=False,
+                )
+            elif ref.kind in SUBTITLE_KINDS:
+                self.ledger.record_subtitle(
+                    work_id,
+                    label=ref.name,
+                    format=ref.kind,
+                    source_url=ref.url,
+                    output_path=str(dest),
+                    status="saved",
+                )
         except Exception as exc:
             try:
                 tmp.unlink()
@@ -636,14 +871,27 @@ class CaptureStore:
             with self.lock:
                 self.state["counters"]["failed"] += 1
                 stream = self.ensure_stream(ref)
-                stream.setdefault("failures", {})[ref.name] = {
+                failures = stream.setdefault("failures", {})
+                failures[ref.name] = {
                     "error": str(exc),
                     "reason": reason,
                     "updated_at": now(),
                 }
+                stream["failures"] = self._trim_map(failures)
                 self.save_state()
             print(f"FAILED {key}: {exc}", flush=True)
             self.log_event({"type": "failed", "key": key, "error": str(exc), "reason": reason})
+            if ref.kind == "ts" and ref.num is not None:
+                self.ledger.record_segment(
+                    variant_id,
+                    ref.num,
+                    source_url=ref.url,
+                    local_path=str(dest),
+                    status="retryable",
+                    increment_attempts=True,
+                    last_error=str(exc),
+                    refresh_metrics=False,
+                )
         finally:
             with self.lock:
                 self.inflight.discard(key)
@@ -731,6 +979,7 @@ class CaptureStore:
         if not ref:
             return 204, "ignored"
         candidate_key = self.stream_key(ref.product, ref.resolution)
+        active_choice: dict[str, Any] = {}
         with self.lock:
             candidates = self.state.setdefault("candidates", {})
             item = candidates.setdefault(
@@ -755,6 +1004,7 @@ class CaptureStore:
             item["last_url"] = url
             item["sample_headers"] = headers
             item["tab_id"] = tab_id
+            item["source_page_url"] = str(payload.get("initiator") or "")
             if ref.kind == "m3u8":
                 item["playlist_url"] = url
                 try:
@@ -770,13 +1020,109 @@ class CaptureStore:
                 item["key_url"] = url
             elif ref.kind in SUBTITLE_KINDS:
                 item.setdefault("subtitle_urls", {})[ref.name] = url
+            active_choice = dict(self.state.setdefault("capture_choices", {}).get(ref.product) or {})
+            if active_choice and not active_choice.get("remember") and int(active_choice.get("expires_at") or 0) < now():
+                self.state["capture_choices"].pop(ref.product, None)
+                active_choice = {}
+            if active_choice:
+                selected_resolution = str(active_choice.get("resolution") or "")
+                tab_matches = active_choice.get("remember") or active_choice.get("tab_id") in {None, tab_id}
+                if active_choice.get("choice") == "ignore" and tab_matches:
+                    item["decision"] = "ignored"
+                elif selected_resolution == ref.resolution and tab_matches:
+                    item["decision"] = active_choice.get("choice") or "pending"
+                else:
+                    item["decision"] = "not-selected"
+            else:
+                item["decision"] = "pending"
             # Keep the most recent 200 candidates so discovery stays lightweight.
             if len(candidates) > 200:
                 oldest = sorted(candidates.items(), key=lambda pair: pair[1].get("last_seen", 0))[:-200]
                 for key, _ in oldest:
                     candidates.pop(key, None)
             self.save_state()
+        if (
+            active_choice.get("choice") == "browser-assisted"
+            and str(active_choice.get("resolution") or "") == ref.resolution
+            and (active_choice.get("remember") or active_choice.get("tab_id") in {None, tab_id})
+        ):
+            status, _ = self.enqueue_payload(payload)
+            return status, "browser-assisted"
         return 200, "candidate"
+
+    def choose_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        product = str(payload.get("product") or "").strip()
+        resolution = str(payload.get("resolution") or "").strip()
+        choice = str(payload.get("choice") or "").strip().lower()
+        remember = bool(payload.get("remember"))
+        if not product:
+            raise RuntimeError("product is required")
+        if choice not in {"direct", "browser-assisted", "ignore", "reset"}:
+            raise RuntimeError("choice must be direct, browser-assisted, ignore, or reset")
+        key = self.stream_key(product, resolution) if resolution else ""
+        with self.lock:
+            candidates = self.state.setdefault("candidates", {})
+            candidate = dict(candidates.get(key) or {}) if key else {}
+            if choice not in {"ignore", "reset"} and not candidate:
+                raise RuntimeError(f"candidate not found: {key}")
+            choices = self.state.setdefault("capture_choices", {})
+            if choice == "reset":
+                choices.pop(product, None)
+                for item in candidates.values():
+                    if item.get("product") == product:
+                        item["decision"] = "pending"
+                self.save_state()
+                return {"choice": "reset", "product": product}
+            tab_id = candidate.get("tab_id") if candidate else payload.get("tab_id")
+            choices[product] = {
+                "choice": choice,
+                "resolution": resolution,
+                "tab_id": tab_id,
+                "remember": remember,
+                "expires_at": now() + (3650 * 24 * 3600 if remember else 6 * 3600),
+                "updated_at": now(),
+            }
+            for item in candidates.values():
+                if item.get("product") != product:
+                    continue
+                if choice == "ignore":
+                    item["decision"] = "ignored"
+                elif item.get("resolution") == resolution:
+                    item["decision"] = choice
+                else:
+                    item["decision"] = "not-selected"
+            self.save_state()
+
+        if choice == "direct":
+            job = self.start_candidate_download(
+                product=product,
+                resolution=resolution,
+                preferred_resolution=resolution,
+                quality_fallback=True,
+            )
+            return {"choice": choice, "product": product, "resolution": resolution, "job": job}
+        if choice == "browser-assisted" and candidate:
+            request_headers = [
+                {"name": str(name), "value": str(value)}
+                for name, value in (candidate.get("sample_headers") or {}).items()
+            ]
+            status, message = self.enqueue_payload(
+                {
+                    "url": candidate.get("segment_url") or candidate.get("playlist_url") or candidate.get("last_url") or "",
+                    "requestHeaders": request_headers,
+                    "initiator": candidate.get("source_page_url") or "",
+                    "tabId": candidate.get("tab_id"),
+                    "timeStamp": time.time() * 1000,
+                }
+            )
+            return {
+                "choice": choice,
+                "product": product,
+                "resolution": resolution,
+                "capture_status": status,
+                "message": message,
+            }
+        return {"choice": choice, "product": product, "resolution": resolution}
 
     def retry_loop(self) -> None:
         while not self.stop_event.wait(self.auto_retry_seconds):
@@ -823,10 +1169,11 @@ class CaptureStore:
         present = set(nums)
         return [num for num in range(nums[0], nums[-1] + 1) if num not in present]
 
-    def collect_stream(self, product: str, resolution: str) -> dict[str, Any]:
+    def collect_stream(self, product: str, resolution: str, probe: bool = True) -> dict[str, Any]:
         folder = self.stream_dir(product, resolution)
         nums = self.stream_numbers(product, resolution)
-        total_bytes = sum(file.stat().st_size for file in folder.glob("*.ts")) if folder.exists() else 0
+        files = list(folder.glob("*.ts")) if folder.exists() else []
+        total_bytes = sum(file.stat().st_size for file in files)
         contiguous = 0
         for num in nums:
             if num == contiguous:
@@ -836,10 +1183,7 @@ class CaptureStore:
         missing = self.stream_missing(product, resolution)
         first = nums[0] if nums else None
         last = nums[-1] if nums else None
-        age = None
-        files = list(folder.glob("*.ts")) if folder.exists() else []
-        if files:
-            age = round(time.time() - max(file.stat().st_mtime for file in files), 1)
+        age = round(time.time() - max(file.stat().st_mtime for file in files), 1) if files else None
         return {
             "product": product,
             "resolution": resolution,
@@ -851,8 +1195,41 @@ class CaptureStore:
             "missing_first": missing[:30],
             "mb": round(total_bytes / 1024 / 1024, 2),
             "latest_age_seconds": age,
-            "media_info": self.probe_stream_info(folder),
+            "media_info": self.probe_stream_info(folder) if probe else None,
         }
+
+    def list_streams_light(self) -> list[dict[str, Any]]:
+        with self.lock:
+            raw_streams = list(self.state.get("streams", {}).values())
+        rows: list[dict[str, Any]] = []
+        for stream in raw_streams:
+            product = stream.get("product") or ""
+            resolution = stream.get("resolution") or ""
+            if not product or not resolution:
+                continue
+            rows.append({
+                "product": product,
+                "resolution": resolution,
+                "width": stream.get("width", 0),
+                "files": int(stream.get("segments_saved") or 0),
+                "first": None,
+                "last": None,
+                "contiguous_from_start": 0,
+                "missing_count": int(len(stream.get("failures") or {})),
+                "missing_first": [],
+                "mb": 0,
+                "latest_age_seconds": None,
+                "media_info": None,
+                "last_seen": stream.get("last_seen"),
+                "last_segment": stream.get("last_segment"),
+                "bad_small_count": len(stream.get("bad_small", {})),
+                "failure_count": len(stream.get("failures", {})),
+                "subtitle_count": len(stream.get("subtitles", {})),
+                "subtitle_outputs": [],
+                "latest_subtitle": None,
+            })
+        rows.sort(key=lambda row: (row["product"], -int(row.get("width") or 0), row["resolution"]))
+        return rows
 
     def probe_stream_info(self, folder: Path) -> dict[str, Any] | None:
         if not folder.exists():
@@ -898,7 +1275,14 @@ class CaptureStore:
         except Exception:
             return None
 
-    def list_streams(self) -> list[dict[str, Any]]:
+    def list_streams(self, use_cache: bool = True) -> list[dict[str, Any]]:
+        now_ts = time.time()
+        if (
+            use_cache
+            and self._streams_cache is not None
+            and now_ts - self._streams_cache_at < self._streams_cache_ttl
+        ):
+            return self._streams_cache
         rows: list[dict[str, Any]] = []
         with self.lock:
             raw_streams = list(self.state.get("streams", {}).values())
@@ -906,7 +1290,7 @@ class CaptureStore:
         for stream in raw_streams:
             key = self.stream_key(stream["product"], stream["resolution"])
             seen_keys.add(key)
-            row = self.collect_stream(stream["product"], stream["resolution"])
+            row = self.collect_stream(stream["product"], stream["resolution"], probe=False)
             subtitle_outputs = self.stream_subtitle_outputs(stream)
             latest_subtitle = subtitle_outputs[-1] if subtitle_outputs else None
             row.update({
@@ -929,8 +1313,10 @@ class CaptureStore:
                         continue
                     key = self.stream_key(product_dir.name, res_dir.name)
                     if key not in seen_keys:
-                        rows.append(self.collect_stream(product_dir.name, res_dir.name))
+                        rows.append(self.collect_stream(product_dir.name, res_dir.name, probe=False))
         rows.sort(key=lambda row: (row["product"], -int(row.get("width") or 0), row["resolution"]))
+        self._streams_cache = rows
+        self._streams_cache_at = now_ts
         return rows
 
     def subtitle_file_metrics(self, path: Path) -> dict[str, Any]:
@@ -976,10 +1362,16 @@ class CaptureStore:
         product = stream.get("product") or ""
         resolution = stream.get("resolution") or ""
         stream_dir = self.stream_dir(product, resolution)
+        # Only scan subtitle-ish folders/files. Avoid rglob over tens of thousands of .ts segments.
         if stream_dir.exists():
-            for path in stream_dir.rglob("*"):
+            for path in stream_dir.iterdir():
                 if path.is_file() and path.suffix.lower() in SUBTITLE_FILE_SUFFIXES:
                     append_if_subtitle(str(path))
+            subtitle_dir = stream_dir / "subtitles"
+            if subtitle_dir.exists():
+                for path in subtitle_dir.rglob("*"):
+                    if path.is_file() and path.suffix.lower() in SUBTITLE_FILE_SUFFIXES:
+                        append_if_subtitle(str(path))
         outputs = list(outputs_by_path.values())
         outputs.sort(key=lambda item: (
             float(item.get("last_seconds") or 0),
@@ -999,8 +1391,17 @@ class CaptureStore:
             archive_headers = dict(self.state.get("archive_headers", {}))
             subtitle_hints = list(self.state.get("subtitle_hints", []))
             inflight = len(self.inflight)
-        rows = self.list_streams()
-        total_mb = round(sum(row["mb"] for row in rows), 2)
+        # Keep /api/status cheap so the extension/dashboard polling cannot stall
+        # behind full capture-directory scans while thousands of segments are inflight.
+        if (
+            self._streams_cache is not None
+            and time.time() - self._streams_cache_at < self._streams_cache_ttl
+        ):
+            rows = self._streams_cache
+            total_mb = round(sum(float(row.get("mb") or 0) for row in rows), 2)
+        else:
+            rows = self.list_streams_light()
+            total_mb = 0
         safe_candidates = []
         for item in sorted(candidates.values(), key=lambda candidate: candidate.get("last_seen", 0), reverse=True)[:100]:
             safe_item = dict(item)
@@ -2012,6 +2413,19 @@ class CaptureStore:
                 pending_extinf = "#EXTINF:2.002,"
         return segments, key_url, key_iv, extinfs
 
+    def playlist_media_sequence(self, text: str) -> int:
+        match = re.search(r"^#EXT-X-MEDIA-SEQUENCE\s*:\s*(\d+)", text, re.M | re.I)
+        return int(match.group(1)) if match else 0
+
+    def extinf_duration(self, extinf: str) -> float | None:
+        match = re.match(r"#EXTINF\s*:\s*([0-9.]+)", extinf, re.I)
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
     def convert_subtitle_file(self, path: Path, mode: str) -> dict[str, Any]:
         mode = normalize_subtitle_convert_mode(mode)
         if mode == "none":
@@ -2228,6 +2642,9 @@ class CaptureStore:
         request_delay_ms: int,
         subtitle_convert_mode: str,
     ) -> None:
+        ledger_session_started = False
+        ledger_work_id = ""
+        ledger_variant_id = ""
         try:
             subtitle_convert_mode = normalize_subtitle_convert_mode(subtitle_convert_mode)
             self.update_job(job_id, status="fetching-playlist", message="Fetching playlist")
@@ -2269,6 +2686,26 @@ class CaptureStore:
                 available_resolutions=[v.get("resolution") for v in variants if v.get("resolution")],
                 message=probe_message,
             )
+            work_id = self.ledger.ensure_work_for_url(product, url, status="downloading")
+            ledger_work_id = work_id
+            sequence_start = self.playlist_media_sequence(playlist_text)
+            ledger_variant_id = self.ledger.ensure_variant(
+                work_id,
+                resolution,
+                playlist_url=media_url,
+                selected=True,
+                media_sequence=sequence_start,
+                expected_segments=len(segments),
+                status="downloading",
+            )
+            self.ledger.create_session(
+                job_id,
+                work_id,
+                selected_variant_ids=[ledger_variant_id],
+                mode="direct",
+                status="downloading",
+            )
+            ledger_session_started = True
 
             stream_ref = MediaRef(product, resolution, Path(urlparse(media_url).path).name or "first.m3u8", "m3u8", media_url, None, parse_resolution(resolution)[0])
             with self.lock:
@@ -2285,6 +2722,24 @@ class CaptureStore:
                 if key_response.status_code == 200 and key_response.content:
                     (folder / "file.key").write_bytes(key_response.content)
             saved_subtitles = self.download_subtitle_tracks(product, resolution, subtitle_tracks, headers, subtitle_convert_mode) if subtitle_tracks else []
+            for track in subtitle_tracks:
+                saved_track = next(
+                    (
+                        item for item in saved_subtitles
+                        if item.get("language") == safe_name(track.get("language") or "und")
+                        and item.get("name") == safe_name(track.get("name") or track.get("language") or "und")
+                    ),
+                    {},
+                )
+                self.ledger.record_subtitle(
+                    work_id,
+                    language=track.get("language") or "und",
+                    label=track.get("name") or "",
+                    format=Path(urlparse(track.get("url") or "").path).suffix.lstrip("."),
+                    source_url=track.get("url") or "",
+                    output_path=str(saved_track.get("path") or ""),
+                    status="failed" if saved_track.get("error") else ("saved" if saved_track else "detected"),
+                )
 
             local_lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:3", "#EXT-X-MEDIA-SEQUENCE:0"]
             if key_url:
@@ -2294,6 +2749,25 @@ class CaptureStore:
                 local_lines.append(Path(urlparse(segment_url).path).name or f"v_{idx:06d}.ts")
             local_lines.append("#EXT-X-ENDLIST")
             (folder / "first.m3u8").write_text("\n".join(local_lines) + "\n", encoding="ascii")
+
+            elapsed_seconds = 0.0
+            ledger_segments: list[dict[str, Any]] = []
+            for idx, segment_url in enumerate(segments):
+                duration = self.extinf_duration(extinfs[idx]) if idx < len(extinfs) else None
+                name = Path(urlparse(segment_url).path).name or f"v_{idx:06d}.ts"
+                ledger_segments.append(
+                    {
+                        "sequence": sequence_start + idx,
+                        "source_url": segment_url,
+                        "duration": duration,
+                        "start_seconds": elapsed_seconds,
+                        "end_seconds": elapsed_seconds + duration if duration is not None else None,
+                        "local_path": str(folder / name),
+                    }
+                )
+                if duration is not None:
+                    elapsed_seconds += duration
+            self.ledger.register_segments(ledger_variant_id, ledger_segments)
 
             self.update_job(job_id, status="downloading", product=product, resolution=resolution, total=len(segments), subtitle_tracks=saved_subtitles, subtitle_convert_mode=subtitle_convert_mode, message="Downloading segments")
             download_started = time.time()
@@ -2316,15 +2790,26 @@ class CaptureStore:
 
             def download_segment(index_url: tuple[int, str]) -> None:
                 index, segment_url = index_url
+                sequence = sequence_start + index
                 if request_delay_ms:
                     time.sleep(request_delay_ms / 1000)
                 name = Path(urlparse(segment_url).path).name or f"v_{index:06d}.ts"
                 dest = folder / name
                 with counters_lock:
                     if dest.exists() and dest.stat().st_size >= self.min_segment_bytes:
+                        existing_size = dest.stat().st_size
                         counters["skipped_existing"] += 1
-                        counters["saved_bytes"] += dest.stat().st_size
+                        counters["saved_bytes"] += existing_size
                         counters["done"] += 1
+                        self.ledger.record_segment(
+                            ledger_variant_id,
+                            sequence,
+                            source_url=segment_url,
+                            local_path=str(dest),
+                            actual_bytes=existing_size,
+                            status="saved",
+                            refresh_metrics=False,
+                        )
                         return
                 try:
                     response = self.session.get(segment_url, headers=headers, timeout=30)
@@ -2347,6 +2832,16 @@ class CaptureStore:
                         if stream:
                             stream["segments_saved"] = int(stream.get("segments_saved") or 0) + 1
                         self.save_state()
+                    self.ledger.record_segment(
+                        ledger_variant_id,
+                        sequence,
+                        source_url=segment_url,
+                        local_path=str(dest),
+                        actual_bytes=len(body),
+                        status="saved",
+                        increment_attempts=True,
+                        refresh_metrics=False,
+                    )
                 except Exception as exc:
                     with counters_lock:
                         counters["failed"] += 1
@@ -2356,6 +2851,16 @@ class CaptureStore:
                             self.state["counters"]["bad_small"] += 1
                         self.save_state()
                     self.log_event({"type": "direct-failed", "job_id": job_id, "segment": name, "error": str(exc)})
+                    self.ledger.record_segment(
+                        ledger_variant_id,
+                        sequence,
+                        source_url=segment_url,
+                        local_path=str(dest),
+                        status="retryable",
+                        increment_attempts=True,
+                        last_error=str(exc),
+                        refresh_metrics=False,
+                    )
                 finally:
                     with counters_lock:
                         counters["done"] += 1
@@ -2364,8 +2869,35 @@ class CaptureStore:
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 list(executor.map(download_segment, enumerate(segments)))
-            self.update_job(job_id, status="complete", **progress_snapshot(), message="Direct download complete")
+            snapshot = progress_snapshot()
+            final_status = "warning" if counters["failed"] else "complete"
+            self.ledger.refresh_variant_metrics(ledger_variant_id)
+            self.ledger.ensure_work_for_url(product, url, status=final_status)
+            self.ledger.ensure_variant(work_id, resolution, selected=True, status=final_status)
+            self.ledger.update_session(
+                job_id,
+                status=final_status,
+                progress=snapshot["percent"],
+                last_progress_at=now(),
+                pause_reason="some segments need retry" if counters["failed"] else "",
+            )
+            self.update_job(
+                job_id,
+                status=final_status,
+                **snapshot,
+                message="Direct download complete" if not counters["failed"] else "Direct download finished with retryable gaps",
+            )
         except Exception as exc:
+            if ledger_session_started:
+                self.ledger.ensure_work_for_url(product, url, status="failed")
+                if ledger_work_id and ledger_variant_id:
+                    self.ledger.ensure_variant(ledger_work_id, resolution, selected=True, status="failed")
+                self.ledger.update_session(
+                    job_id,
+                    status="failed",
+                    pause_reason=str(exc),
+                    last_progress_at=now(),
+                )
             self.update_job(job_id, status="failed", message=str(exc))
 
     def choose_primary_resolution(self, product: str, requested: str | None) -> str | None:
@@ -2790,7 +3322,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div class="card-head">
           <h2>Captured streams</h2>
           <div class="toolbar" style="margin: 0;">
-            <label class="check" title="When ticked, Delete also removes the downloaded segment files from disk"><input id="deleteFiles" type="checkbox"> Delete files on disk too</label>
+            <span class="hint">磁盘文件不会自动清理；需要时请在对应作品行点击「删除下载分片…」。</span>
             <button id="retryAll">Retry all missing</button>
           </div>
         </div>
@@ -2872,16 +3404,16 @@ DASHBOARD_HTML = r"""<!doctype html>
     <section class="panel" data-panel="jobs">
       <div class="card">
         <div class="card-head">
-          <h2>Jobs</h2>
-          <div class="toolbar" style="margin: 0;">
-            <span class="hint">Downloads, merges and archive runs.</span>
-            <button id="clearJobs">Clear finished</button>
-          </div>
+            <h2>下载任务</h2>
+            <div class="toolbar" style="margin: 0;">
+              <span class="hint">删除任务只清理列表记录，不会删除已经下载的文件。</span>
+              <button id="clearJobs">清除全部已结束任务</button>
+            </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Job</th><th>Status</th><th>Target</th><th>Quality</th><th>Progress</th><th>Speed</th><th>Subtitles</th><th>Message</th></tr>
+              <tr><th>Job</th><th>Status</th><th>Target</th><th>Quality</th><th>Progress</th><th>Speed</th><th>Subtitles</th><th>Message</th><th>操作</th></tr>
             </thead>
             <tbody id="jobs"></tbody>
           </table>
@@ -2962,7 +3494,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           <td><div class="actions">
             <button class="mini primary" data-action="candidate-download" data-product="${item.product}" data-resolution="${item.resolution}">Download</button>
             <button class="mini" data-action="candidate-subtitles" data-product="${item.product}" data-resolution="${item.resolution}">Subtitles only</button>
-            <button class="mini danger" data-action="delete-candidate" data-product="${item.product}" data-resolution="${item.resolution}">Remove</button>
+            <button class="mini danger" data-action="delete-candidate" data-product="${item.product}" data-resolution="${item.resolution}">移除发现记录</button>
           </div></td>`;
         candidates.appendChild(tr);
       }
@@ -2999,7 +3531,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <button class="mini" data-action="open-subtitles" data-product="${row.product}" data-resolution="${row.resolution}">CC folder</button>
             <button class="mini" data-action="convert-subtitles" data-product="${row.product}" data-resolution="${row.resolution}">Convert CC</button>
             <button class="mini" data-action="export-player-subtitle" data-product="${row.product}" data-resolution="${row.resolution}">Export CC</button>
-            <button class="mini danger" data-action="delete-stream" data-product="${row.product}" data-resolution="${row.resolution}">Delete</button>
+            <button class="mini danger" data-action="delete-stream-files" data-product="${row.product}" data-resolution="${row.resolution}">删除下载分片…</button>
           </div></td>`;
         rows.appendChild(tr);
       }
@@ -3009,7 +3541,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const jobs = $("jobs");
       jobs.innerHTML = "";
       if (!list.length) {
-        jobs.innerHTML = '<tr><td class="empty" colspan="8">No jobs yet.</td></tr>';
+        jobs.innerHTML = '<tr><td class="empty" colspan="9">还没有下载任务。</td></tr>';
         return;
       }
       for (const job of list) {
@@ -3028,6 +3560,10 @@ DASHBOARD_HTML = r"""<!doctype html>
               ${hasSubtitles ? `<button class="mini" data-action="export-player-subtitle" data-product="${job.product || ""}" data-resolution="${job.resolution || ""}">Export CC</button>` : ""}
             </div>`
           : "";
+        const canDelete = ["complete", "failed", "warning"].includes(job.status);
+        const deleteAction = canDelete
+          ? `<button class="mini danger" data-action="delete-job" data-job-id="${job.id || ""}">删除任务记录</button>`
+          : `<span class="label">运行中不可删除</span>`;
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td class="mono">${job.id || ""}<br>${job.type || ""}</td>
@@ -3037,7 +3573,8 @@ DASHBOARD_HTML = r"""<!doctype html>
           <td><progress value="${Math.min(done, progressMax)}" max="${progressMax}"></progress> ${pct}%<br>${done}/${total}<br><span class="label">saved ${job.saved || 0}, existing ${job.skipped_existing || 0}, failed ${job.failed || 0}, small ${job.bad_small || 0}</span></td>
           <td>${job.workers || ""} workers<br><span class="label">${job.request_delay_ms || 0} ms/request</span><br>${job.speed_mbps || 0} MB/s<br><span class="label">${mb} MB${eta ? ", ETA " + eta : ""}</span></td>
           <td>${(job.subtitle_tracks || []).length}<br><span class="label">${job.subtitle_convert_mode || "none"}</span></td>
-          <td>${job.message || ""}${jobActions}</td>`;
+          <td>${job.message || ""}${jobActions}</td>
+          <td>${deleteAction}</td>`;
         jobs.appendChild(tr);
       }
     }
@@ -3109,8 +3646,9 @@ DASHBOARD_HTML = r"""<!doctype html>
           return refresh();
         }
         if (btn.id === "clearJobs") {
+          if (!window.confirm("清除所有已结束任务的列表记录？已下载的分片、视频和 Archive 文件都会保留。")) return;
           const result = await api("/api/clear-jobs", { method: "POST", headers: {"content-type":"application/json"}, body: "{}" });
-          log(`cleared ${result.cleared} finished job(s)`);
+          log(`已清除 ${result.cleared} 条已结束任务记录；下载文件已保留`);
           return refresh();
         }
         if (btn.id === "startArchiveFanbox") {
@@ -3201,20 +3739,24 @@ DASHBOARD_HTML = r"""<!doctype html>
           log(`subtitle-only job started: ${result.id}`);
           return refresh();
         }
+        if (btn.dataset.action === "delete-job") {
+          const jobId = btn.dataset.jobId;
+          if (!window.confirm(`删除任务 ${jobId} 的列表记录？已下载文件会保留。`)) return;
+          const result = await api("/api/delete-job", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({job_id: jobId}) });
+          log(result.removed ? `已删除任务记录 ${jobId}；下载文件已保留` : `任务记录不存在：${jobId}`);
+          return refresh();
+        }
         const product = btn.dataset.product;
         const resolution = btn.dataset.resolution;
         if (btn.dataset.action === "retry") {
           const result = await api("/api/retry-missing", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution}) });
           log(`${product}/${resolution} retry queued ${result.queued}`);
         }
-        if (btn.dataset.action === "delete-stream") {
-          const withFiles = $("deleteFiles").checked;
-          const message = withFiles
-            ? `Delete ${product}/${resolution} AND its downloaded files on disk? This cannot be undone.`
-            : `Delete the record for ${product}/${resolution}? Downloaded files on disk are kept.`;
+        if (btn.dataset.action === "delete-stream-files") {
+          const message = `永久删除 ${product}/${resolution} 已下载的分片文件？此操作无法撤销，但不会删除其他作品或已经合并的成品视频。`;
           if (!window.confirm(message)) return;
-          const result = await api("/api/delete-stream", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution, delete_files: withFiles}) });
-          log(`deleted ${result.deleted}${result.files_deleted ? " (files removed from disk)" : " (files kept)"}`);
+          const result = await api("/api/delete-stream", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution, delete_files: true}) });
+          log(result.files_deleted ? `已删除 ${result.deleted} 的下载分片` : `${result.deleted} 没有可删除的分片目录`);
         }
         if (btn.dataset.action === "delete-candidate") {
           const result = await api("/api/delete-candidate", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({product, resolution}) });
@@ -3334,6 +3876,15 @@ def make_handler(store: CaptureStore):
             if parsed.path == "/api/streams":
                 self.send_json(200, store.list_streams())
                 return
+            if parsed.path == "/api/works":
+                works = store.list_works()
+                self.send_json(200, {"works": works, "count": len(works)})
+                return
+            if parsed.path.startswith("/api/works/"):
+                work_id = unquote(parsed.path.removeprefix("/api/works/")).strip()
+                work = store.ledger.get_work(work_id)
+                self.send_json(200 if work else 404, work or {"error": "work not found"})
+                return
             self.send_text(404, "not found")
 
         def do_POST(self) -> None:
@@ -3364,6 +3915,14 @@ def make_handler(store: CaptureStore):
                     )
                     self.send_json(200, result)
                     return
+                if parsed.path == "/api/works/reindex":
+                    result = store.reindex_work(
+                        product=str(payload.get("product") or ""),
+                        resolution=str(payload.get("resolution") or ""),
+                        site=str(payload.get("site") or "legacy-local"),
+                    )
+                    self.send_json(200, result)
+                    return
                 if parsed.path == "/api/delete-stream":
                     result = store.delete_stream(
                         product=str(payload.get("product") or ""),
@@ -3381,6 +3940,9 @@ def make_handler(store: CaptureStore):
                     return
                 if parsed.path == "/api/clear-jobs":
                     self.send_json(200, store.clear_finished_jobs())
+                    return
+                if parsed.path == "/api/delete-job":
+                    self.send_json(200, store.delete_job(str(payload.get("job_id") or "")))
                     return
                 if parsed.path == "/api/direct-download":
                     preferred_resolutions = payload.get("preferred_resolutions") or []
@@ -3427,6 +3989,9 @@ def make_handler(store: CaptureStore):
                     ]
                     result = jobs[0] if len(jobs) == 1 else {"jobs": jobs, "count": len(jobs)}
                     self.send_json(200, result)
+                    return
+                if parsed.path == "/api/candidate-choice":
+                    self.send_json(200, store.choose_candidate(payload))
                     return
                 if parsed.path == "/api/start-candidate-subtitles":
                     result = store.start_candidate_subtitle_download(
@@ -3508,7 +4073,13 @@ def main() -> int:
     print(f"Capture endpoint: http://{args.host}:{args.port}/capture", flush=True)
     print(f"Data: {args.data_dir}", flush=True)
     print(f"Archives: {args.archive_dir}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        store.stop_event.set()
+        store.executor.shutdown(wait=False, cancel_futures=True)
+        store.save_state(force=True)
+        server.server_close()
     return 0
 
 

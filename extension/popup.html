@@ -1,127 +1,109 @@
 <!doctype html>
-<html lang="en-AU">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Web Keeper</title>
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #f2f4f8; --surface: #ffffff; --surface2: #f7f9fc;
-      --border: #e2e8f0; --border-strong: #c7d2e0;
-      --text: #0f172a; --muted: #64748b;
-      --accent: #2563eb; --accent-hover: #1d4ed8; --accent-soft: #eff4ff;
-      --ok: #15803d; --warn: #9a6700; --bad: #b42318;
-      --ok-soft: #ecfdf3; --bad-soft: #fef3f2;
-      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      --bg: #f4f6fa; --card: #fff; --soft: #f8fafc; --line: #dce3ec;
+      --text: #172033; --muted: #667085; --blue: #2563eb; --blue2: #1d4ed8;
+      --green: #15803d; --green-bg: #effcf3; --red: #b42318; --red-bg: #fff1f0;
+      font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #0b1220; --surface: #121a2b; --surface2: #182338;
-        --border: #263349; --border-strong: #35455f;
-        --text: #e2e8f0; --muted: #94a3b8;
-        --accent: #3b82f6; --accent-hover: #60a5fa; --accent-soft: #1a2a4a;
-        --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
-        --ok-soft: #12291c; --bad-soft: #331512;
+        --bg: #0d1422; --card: #131d2f; --soft: #19253a; --line: #2c3a52;
+        --text: #e6edf7; --muted: #9aa9bd; --blue: #3b82f6; --blue2: #60a5fa;
+        --green: #4ade80; --green-bg: #12291c; --red: #fb7185; --red-bg: #35171b;
       }
     }
     * { box-sizing: border-box; }
-    body { margin: 0; width: 380px; background: var(--bg); color: var(--text); font-size: 13px; }
-    header { padding: 12px 14px; background: var(--surface); border-bottom: 1px solid var(--border); }
-    .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; }
-    .logo { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: #fff; background: var(--accent); font-weight: 800; }
-    .pill { border-radius: 999px; padding: 3px 9px; font-size: 12px; background: var(--surface2); border: 1px solid var(--border); color: var(--muted); }
-    .pill.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
-    .pill.bad { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
-    main { padding: 12px; display: grid; gap: 10px; }
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
-    .row { display: flex; align-items: center; gap: 8px; }
+    html, body { margin: 0; width: 410px; min-width: 410px; max-width: 410px; overflow-x: hidden; }
+    body { max-height: 600px; overflow-y: auto; background: var(--bg); color: var(--text); font-size: 13px; }
+    header, main, footer { width: 100%; max-width: 100%; min-width: 0; }
+    header { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border-bottom: 1px solid var(--line); background: var(--card); }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 750; }
+    .logo { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; color: white; background: var(--blue); font-size: 17px; }
+    .pill { padding: 4px 9px; border-radius: 999px; background: var(--soft); color: var(--muted); border: 1px solid var(--line); }
+    .pill.ok { color: var(--green); background: var(--green-bg); border-color: transparent; }
+    .pill.bad { color: var(--red); background: var(--red-bg); border-color: transparent; }
+    main { display: grid; gap: 10px; padding: 11px; }
+    .notice, .card { min-width: 0; max-width: 100%; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--card); padding: 12px; }
+    .notice { display: flex; align-items: flex-start; gap: 10px; }
+    .notice > :last-child { min-width: 0; }
+    .notice.found { border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); background: color-mix(in srgb, var(--blue) 8%, var(--card)); }
+    .notice.offline { border-color: color-mix(in srgb, var(--red) 40%, var(--line)); background: var(--red-bg); }
+    .icon { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 50%; background: var(--card); font-weight: 800; }
+    .title { font-weight: 720; line-height: 1.4; overflow-wrap: anywhere; }
+    .detail, .muted { color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
     .between { justify-content: space-between; }
-    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
-    .label { color: var(--muted); font-size: 12px; }
-    .value { font-size: 18px; font-weight: 700; margin-top: 2px; }
-    button { border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface); color: var(--text); padding: 7px 11px; cursor: pointer; font: inherit; font-weight: 550; }
-    button:hover { background: var(--surface2); }
-    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
-    button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-    button.danger { color: var(--bad); }
-    input[type="text"] { width: 100%; border: 1px solid var(--border-strong); border-radius: 7px; padding: 8px; font: 12px Consolas, monospace; background: var(--surface2); color: var(--text); }
-    input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
-    .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .listen { display: flex; align-items: center; gap: 9px; cursor: pointer; font-weight: 650; }
     .switch { position: relative; width: 42px; height: 24px; }
     .switch input { display: none; }
-    .slider { position: absolute; inset: 0; cursor: pointer; background: var(--border-strong); border-radius: 999px; transition: .15s; }
-    .slider:before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: white; border-radius: 50%; transition: .15s; box-shadow: 0 1px 3px #0003; }
-    .switch input:checked + .slider { background: var(--accent); }
-    .switch input:checked + .slider:before { transform: translateX(18px); }
-    .list { display: grid; gap: 8px; max-height: 174px; overflow: auto; }
-    .item { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--surface2); }
-    .item-title { font: 12px Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .muted { color: var(--muted); font-size: 12px; }
-    progress { width: 100%; height: 10px; accent-color: var(--accent); }
-    footer { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface); }
-    #toast { min-height: 16px; color: var(--muted); font-size: 12px; padding: 0 12px 10px; background: var(--surface); }
-    .ok { color: var(--ok); }
-    .warn { color: var(--warn); }
-    .bad { color: var(--bad); }
+    .slider { position: absolute; inset: 0; border-radius: 99px; background: #aab4c3; transition: .15s; }
+    .slider::before { content: ""; position: absolute; width: 18px; height: 18px; top: 3px; left: 3px; border-radius: 50%; background: white; box-shadow: 0 1px 3px #0004; transition: .15s; }
+    .switch input:checked + .slider { background: var(--blue); }
+    .switch input:checked + .slider::before { transform: translateX(18px); }
+    .works { display: grid; gap: 9px; }
+    .work { display: grid; min-width: 0; max-width: 100%; gap: 9px; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft); }
+    .work-name { min-width: 0; max-width: 100%; flex: 1; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    select { max-width: 155px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--text); font: inherit; }
+    .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; min-width: 0; }
+    button, .button { min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text); cursor: pointer; font: inherit; font-weight: 650; white-space: normal; overflow-wrap: anywhere; text-decoration: none; text-align: center; }
+    button:hover, .button:hover { background: var(--soft); }
+    button.primary, .button.primary { background: var(--blue); border-color: var(--blue); color: white; }
+    button.primary:hover, .button.primary:hover { background: var(--blue2); }
+    button.wide, .button.wide { grid-column: 1 / -1; }
+    button.link, .button.link { padding: 3px 5px; border: 0; color: var(--blue); background: transparent; font-weight: 600; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .remember { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+    progress { width: 100%; height: 9px; accent-color: var(--blue); }
+    footer { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line); background: var(--card); }
+    footer button, footer .button { flex: 0 0 auto; }
+    #message { min-width: 0; flex: 1; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   </style>
 </head>
 <body>
   <header>
-    <div class="top">
-      <div class="brand"><div class="logo">W</div><div>Web Keeper</div></div>
-      <div id="connection" class="pill">checking</div>
-    </div>
+    <div class="brand"><div class="logo">W</div><span>Web Keeper</span></div>
+    <div id="connection" class="pill" data-i18n="statusChecking">正在检查</div>
   </header>
   <main>
-    <section class="card">
-      <div class="row between">
-        <label class="toggle">
-          <span class="switch"><input id="discover" type="checkbox"><span class="slider"></span></span>
-          <span>Discover</span>
-        </label>
-        <label class="toggle">
-          <span class="switch"><input id="enabled" type="checkbox"><span class="slider"></span></span>
-          <span>Capture</span>
-        </label>
+    <section id="notice" class="notice" aria-live="polite">
+      <div id="noticeIcon" class="icon">…</div>
+      <div>
+        <div id="noticeTitle" class="title" data-i18n="currentPageChecking">正在检查当前页面</div>
+        <div id="noticeDetail" class="detail" data-i18n="pleaseWait">请稍候</div>
       </div>
-      <div style="margin-top:10px">
-        <input id="serverUrl" type="text" title="Local server URL">
-      </div>
-    </section>
-
-    <section class="grid">
-      <div class="stat"><div class="label">Candidates</div><div id="candidateCount" class="value">0</div></div>
-      <div class="stat"><div class="label">Jobs</div><div id="jobCount" class="value">0</div></div>
-      <div class="stat"><div class="label">Saved</div><div id="savedCount" class="value">0</div></div>
     </section>
 
     <section class="card">
-      <div class="row between" style="margin-bottom:8px">
-        <strong>Downloadable</strong>
-        <button id="refresh">Refresh</button>
+      <div class="row between">
+        <label class="listen"><span class="switch"><input id="discover" type="checkbox"><span class="slider"></span></span><span data-i18n="listenVideos">监听网页视频</span></label>
+        <button id="refresh" class="link" data-i18n="refresh">刷新</button>
       </div>
-      <div id="candidates" class="list"><div class="muted">No candidates yet.</div></div>
+      <div class="detail" style="margin-top:8px" data-i18n="listenDescription">找到视频后会先询问你，不会自动下载。</div>
     </section>
 
     <section class="card">
-      <div class="row between" style="margin-bottom:8px">
-        <strong>Progress</strong>
-        <span id="speed" class="muted">0 MB/s</span>
-      </div>
-      <div id="jobs" class="list"><div class="muted">No active jobs.</div></div>
+      <div class="row between" style="margin-bottom:9px"><strong data-i18n="detectedVideos">当前页面的视频</strong><span id="workCount" class="muted">0 个</span></div>
+      <div id="works" class="works"><div class="muted">打开监听并播放视频后，这里会出现提示。</div></div>
+    </section>
+
+    <section id="progressCard" class="card">
+      <div class="row between" style="margin-bottom:9px"><strong data-i18n="recentDownloads">最近下载</strong><span id="speed" class="muted">0 MB/s</span></div>
+      <div id="jobs" class="works"><div class="muted" data-i18n="noTasks">目前没有下载。</div></div>
     </section>
   </main>
   <footer>
-    <div class="row">
-      <button id="save">Save</button>
-      <button id="start" class="primary">Start</button>
-      <button id="stop" class="danger">Stop</button>
-    </div>
-    <button id="open">Dashboard</button>
+    <div id="message"></div>
+    <a id="open" class="button" href="download.html" target="_blank" data-i18n="openDownloadCenter">下载中心</a>
+    <a id="settings" class="button" href="settings.html" target="_blank" data-i18n-title="settings" title="设置" aria-label="设置">⚙</a>
   </footer>
-  <div id="toast"></div>
+  <script src="i18n.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

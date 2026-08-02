@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title data-i18n="downloadCenter">下载中心</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f3f6fb; --card:#fff; --soft:#f7f9fc; --line:#d9e1ec; --text:#172033; --muted:#667085; --blue:#2563eb; --green:#15803d; --red:#b42318; font-family:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif; }
+    @media (prefers-color-scheme:dark) { :root { --bg:#0c1422; --card:#131d2f; --soft:#19253a; --line:#2b3a52; --text:#e7edf7; --muted:#9aa9bd; --blue:#3b82f6; --green:#4ade80; --red:#fb7185; } }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 system-ui,"Microsoft YaHei UI",sans-serif; }
+    header { background:var(--card); border-bottom:1px solid var(--line); padding:17px 22px; }
+    header div { max-width:980px; margin:auto; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    h1 { margin:0; font-size:20px; }
+    main { max-width:980px; margin:22px auto; padding:0 16px 40px; display:grid; gap:14px; }
+    .card { min-width:0; overflow:hidden; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; }
+    .hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:start; }
+    .title { font-size:20px; font-weight:750; overflow-wrap:anywhere; }
+    .muted { color:var(--muted); }
+    .pill { display:inline-flex; padding:4px 10px; border-radius:999px; background:var(--soft); border:1px solid var(--line); color:var(--muted); }
+    .pill.ok { color:var(--green); }
+    .pill.bad { color:var(--red); }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+    .stat { background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:11px; }
+    .stat strong { display:block; font-size:18px; }
+    progress { width:100%; height:13px; margin:15px 0 5px; accent-color:var(--blue); }
+    .actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:14px; }
+    button, .button { appearance:none; display:inline-flex; align-items:center; justify-content:center; padding:9px 13px; border:1px solid var(--line); border-radius:9px; color:var(--text); background:var(--card); cursor:pointer; font:inherit; font-weight:650; text-decoration:none; }
+    button.primary { color:white; background:var(--blue); border-color:var(--blue); }
+    button.danger { color:var(--red); }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .notice { margin-top:14px; padding:11px 13px; border-radius:9px; background:var(--soft); border:1px solid var(--line); }
+    .notice.bad { color:var(--red); }
+    .log { max-height:240px; overflow:auto; background:#0b1220; color:#cbd5e1; border-radius:9px; padding:11px; font:12px/1.55 Consolas,monospace; white-space:pre-wrap; }
+    details summary { cursor:pointer; font-weight:700; } details .muted { margin:6px 0 10px; }
+    nav { display:flex; align-items:center; gap:8px; }
+    .tasks { display:grid; gap:10px; }
+    .task { min-width:0; padding:13px; border:1px solid var(--line); background:var(--soft); border-radius:10px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
+    .work-card { padding:15px; border:1px solid var(--line); background:var(--soft); border-radius:12px; display:grid; gap:11px; }
+    .work-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .chips { display:flex; flex-wrap:wrap; gap:6px; }
+    .chip { padding:3px 8px; border:1px solid var(--line); border-radius:999px; color:var(--muted); background:var(--card); font-size:12px; }
+    .timeline { display:grid; gap:7px; margin-top:12px; }
+    .range { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); }
+    [hidden] { display:none !important; }
+    @media (max-width:650px) { .hero,.task { grid-template-columns:1fr; } .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header><div><h1>Web Keeper</h1><nav><a class="button" href="download.html" data-i18n="openDownloadCenter">下载中心</a><a class="button" href="settings.html" data-i18n="settings">设置</a></nav></div></header>
+  <main>
+    <section id="taskView" class="card" hidden>
+      <div class="hero">
+        <div><div id="title" class="title" data-i18n="downloadTask">视频下载</div><div id="subtitle" class="muted"></div></div>
+        <span id="status" class="pill" data-i18n="statusChecking">正在检查</span>
+      </div>
+      <progress id="progress" value="0" max="1"></progress>
+      <div id="progressText" class="muted" data-i18n="downloadProgress">下载进度</div>
+      <div class="grid">
+        <div class="stat"><span class="muted" data-i18n="completedItems">已完成</span><strong id="saved">0</strong></div>
+        <div class="stat"><span class="muted" data-i18n="remainingItems">待补内容</span><strong id="missing">—</strong></div>
+        <div class="stat"><span class="muted" data-i18n="savedSize">已保存</span><strong id="bytes">0 MB</strong></div>
+        <div class="stat"><span class="muted" data-i18n="downloadSpeed">下载速度</span><strong id="speed">—</strong></div>
+      </div>
+      <div id="notice" class="notice" data-i18n="chooseFolderIntro">请选择或新建一个专用子文件夹，例如 Downloads\Web Keeper。浏览器不允许直接授权系统文件夹根目录。</div>
+      <div id="locationPanel" class="notice" hidden><strong data-i18n="saveLocation">保存位置</strong><div id="locationText" class="muted"></div></div>
+      <section id="missingPanel" class="timeline" hidden><strong data-i18n="missingTimeline">需要补全的位置</strong><div id="missingRanges"></div></section>
+      <div class="actions">
+        <button id="choose" class="primary" data-i18n="chooseFolderAndStart">选择位置并开始</button>
+        <button id="resume" hidden data-i18n="continueDownload">继续</button>
+        <button id="backToVideo" hidden data-i18n="returnToVideo">返回网页继续播放</button>
+        <button id="switchAssisted" hidden data-i18n="switchToAssisted">改用网页辅助</button>
+        <button id="smartFill" hidden data-i18n="smartFill">智能补全缺失位置</button>
+        <button id="merge" hidden data-i18n="checkAndCreateVideo">检查并生成视频</button>
+        <button id="openOutput" hidden data-i18n="openGeneratedVideo">打开生成的视频</button>
+        <button id="subtitles" hidden data-i18n="saveSubtitles">保存字幕</button>
+        <button id="pause" hidden data-i18n="pauseDownload">暂停</button>
+        <button id="deleteSegments" class="danger" hidden data-i18n="cleanTemporaryFiles">清理临时下载文件</button>
+        <button id="deleteOutput" class="danger" hidden data-i18n="deleteOutput">删除生成的视频</button>
+        <button id="removeTask" class="danger" hidden data-i18n="removeTask">从列表移除</button>
+      </div>
+    </section>
+
+    <section id="listView" class="card" hidden>
+      <div class="hero"><div><div class="title" data-i18n="worksAndDownloads">作品和下载</div><div class="muted" data-i18n="downloadCenterDescription">查看视频进度、继续未完成下载并找到保存位置。</div></div><a class="button" href="settings.html" data-i18n="settings">设置</a></div>
+      <div id="taskList" class="tasks" style="margin-top:14px"></div>
+    </section>
+
+    <details id="diagnosticsPanel" class="card">
+      <summary data-i18n="diagnostics">诊断信息</summary>
+      <div class="muted" data-i18n="diagnosticsDescription">遇到问题时展开；正常使用不需要查看。</div>
+      <div id="log" class="log" data-i18n="taskLoading">正在读取下载信息…</div>
+    </details>
+  </main>
+  <script src="i18n.js"></script>
+  <script src="vendor/mux.js/mux-mp4.min.js"></script>
+  <script src="media-engine.js"></script>
+  <script src="download.js"></script>
+</body>
+</html>

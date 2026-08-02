@@ -1,6 +1,8 @@
 ﻿# Web Keeper
 
-Web Keeper is a local browser-assisted download and archiving tool. It keeps the existing HLS capture workflow, and adds a separate Archive module for site attachments such as FANBOX ZIP files.
+> Current extension development version: **0.3.6**
+
+Web Keeper is a browser-first HLS discovery, direct-download, and assisted-capture tool. The main video flow now runs entirely inside the extension; the legacy Python Dashboard remains available for existing captures, native ffmpeg workflows, and Archive jobs.
 
 [中文文档](README.zh-CN.md)
 
@@ -8,29 +10,33 @@ Web Keeper is a local browser-assisted download and archiving tool. It keeps the
 
 ## What It Does
 
-Web Keeper runs as three local pieces:
+Web Keeper currently has two independent paths:
 
 ```text
-Browser extension -> local Python server -> local downloads / archives / outputs
+Default video flow: browser extension -> private resumable workspace -> browser Downloads
+Legacy/Archive flow: browser or manual input -> local Python server -> data / archives / outputs
 ```
 
-The browser extension observes requests that your browser is already allowed to make. The local Python server stores candidates, downloads files with the captured headers when needed, tracks progress, and exposes a Dashboard at `http://127.0.0.1:17888/`.
+The extension observes requests that the browser is already allowed to make and stores candidates and checkpoints locally. By default it finishes and validates media in private extension storage, then hands the finished file to the browser Downloads API. A user-selected custom folder remains available as an advanced alternative. The Python service is no longer required for the core video flow.
 
 Web Keeper does not decrypt DRM, bypass access controls, or grant access to content your browser cannot already load.
 
 ## Modules
 
-### HLS Capture
+### Browser Media Engine
 
-The HLS module is for ordinary `.m3u8` playback streams:
+The extension identifies and executes direct media files, HLS, DASH/CMAF, and browser-assisted saving:
 
+- discovers ordinary MP4, WebM, and audio responses, including extensionless media URLs;
+- streams direct files to disk and resumes from existing bytes when the server supports HTTP Range;
 - discovers `.m3u8`, `.ts`, `.key`, and subtitle requests from the browser;
-- records playlist, segment, key, and subtitle metadata;
-- downloads HLS segments in the background;
-- retries missing pieces;
-- detects bad tiny segment responses such as `30B` / `33B` placeholders;
-- merges downloaded segments to MP4 with ffmpeg;
-- supports subtitle-only downloads and subtitle conversion workflows.
+- records playlist, segment, key, subtitle, and checkpoint metadata;
+- downloads HLS directly or follows only the segments requested by the player;
+- decrypts ordinary AES-128 HLS in the browser;
+- joins MPEG-TS and common fragmented MP4 output without requiring the Python service;
+- combines separate `EXT-X-MEDIA` audio and video for common static CMAF HLS;
+- parses DASH `SegmentTemplate` / `SegmentTimeline`, checkpoints separate tracks, and combines clear CMAF audio and video in the browser;
+- saves detected subtitles next to the video.
 
 ### Archive
 
@@ -57,55 +63,46 @@ Archive jobs appear in the same Dashboard Jobs table as HLS jobs.
 
 ## Quick Start
 
-1. Install dependencies:
-
-```powershell
-.\scripts\install_requirements.ps1
-```
-
-2. Start the local server:
-
-```powershell
-.\scripts\start_server.ps1
-```
-
-3. Start Edge with the extension loaded:
+1. Start an isolated Edge test window with the unpacked extension:
 
 ```powershell
 .\scripts\start_edge.ps1
 ```
 
-4. Open the Dashboard:
+Alternatively, enable Developer mode at `edge://extensions`, choose **Load unpacked**, and select the `extension` directory. Enable listening, play a video, then choose a mode from the popup. Finished files use browser Downloads by default.
 
-[http://127.0.0.1:17888/](http://127.0.0.1:17888/)
+No Helper or Python server is required for this flow. Run `.\scripts\start_server.ps1` only when you need the legacy Dashboard, existing captures, Archive, or native ffmpeg tools.
+
+Settings can switch the destination to a custom folder. Chromium may reject system-folder roots in the custom-folder picker; this does not affect the recommended browser Downloads mode.
 
 ## Browser Extension
 
-The extension has two main switches:
+The extension has one listening switch. Discovery never starts a download by itself. After a candidate is found, choose:
 
-- `Discover`: observe useful browser requests and send candidates to the local server.
-- `Capture`: actively capture HLS media requests for background downloading.
+- **Direct download (recommended):** parse the playlist, save missing segments with checkpoints, decrypt ordinary AES-128 HLS, and generate a `.ts` or fragmented `.mp4` output.
+- **Browser-assisted capture:** conservatively save only segments actually requested by the player. Keep the task page open and continue playback.
+- **Ignore this time:** do not create a task.
 
-For Archive workflows, keep `Discover` enabled. When you open FANBOX in that browser, the extension automatically saves recent FANBOX request headers to the local server. Archive downloads use those saved headers first, and manual headers are only a fallback or override.
+The extension never scans or modifies the existing `data/captures` tree. Each new task uses a private resumable workspace or a user-approved custom folder. Temporary HLS pieces have a separate cleanup action. Tasks can also be removed from the download-centre list without deleting saved files or resumable content.
+
+Browser-assisted tasks show missing time ranges. The user-triggered gap filler seeks only those ranges, slows down when the player is not ready, and stops after repeated lack of progress.
+
+## Local Release Package
+
+The development package is `dist/Web-Keeper-0.3.6.zip`. Extract it, enable Developer mode in Edge/Chrome, and choose **Load unpacked**. The archive excludes the experimental Helper and does not require the Python service. The recommended destination uses the browser Downloads API, so it can save to the normal Downloads folder without granting that folder through the File System Access picker.
 
 After changing extension files, reload the extension in Edge/Chrome.
 
-## HLS Workflow
+## Video Workflow
 
 Recommended flow:
 
-1. Open the video page and start playback.
-2. Enable `Discover` in the extension.
-3. Wait for the Dashboard to show a candidate video.
-4. Use `Direct download` from the Dashboard when a playlist or segment candidate is available.
-5. If pieces are missing, use `Retry` or replay the missing area in the browser to refresh authorization.
-6. Merge when enough segments are saved.
-
-Merge strategies:
-
-- `strict`: requires a complete segment set.
-- `skip`: skips missing pieces and keeps playback continuous where possible.
-- `fill-skip`: fills missing pieces from lower qualities when available, then skips any remaining gaps.
+1. Enable video detection in the extension and play the target video briefly.
+2. Open the popup when the `!` badge appears.
+3. Choose a quality and either **Direct download (recommended)** or **Web-assisted saving**.
+4. The task starts in the extension's private resumable workspace and publishes the validated result to browser Downloads. Choose a custom folder only if you specifically want one.
+5. Reopen an interrupted task and select **Continue**; completed bytes or segments are skipped.
+6. For an assisted task with gaps, use the missing-time guidance or the user-confirmed gap filler, then create the output.
 
 ## Archive Workflow: FANBOX ZIP Files
 
@@ -214,7 +211,7 @@ If ffmpeg is missing, the Dashboard shows a banner with a download link (https:/
 
 ## Privacy
 
-The extension sends selected browser request URLs and headers to `127.0.0.1`. Headers may include cookies or authorization tokens. Do not publish or share these files:
+The default extension-only video flow keeps candidates, required request headers, and checkpoints in browser-local storage. It does not contact a remote service or `127.0.0.1`. Only the explicitly started legacy Python Dashboard/Archive flow may send selected URLs and headers to the local service. Those headers may include cookies or authorization tokens. Do not publish or share these legacy files:
 
 - `data/state.json`
 - `data/requests.jsonl`
@@ -228,6 +225,7 @@ Web Keeper is most useful for ordinary HLS streams and normal downloadable attac
 - DRM-protected media;
 - sources that intentionally return empty or one-time segments;
 - extremely short-lived tokens bound to device fingerprint, IP, or playback session;
+- non-CMAF or live HLS with separate audio, and multi-Period or non-standard DASH manifests;
 - sites where the real filename is only available through a site-specific API that has not been adapted yet.
 
 ## Roadmap
@@ -237,5 +235,5 @@ Web Keeper is most useful for ordinary HLS streams and normal downloadable attac
 - Image filename and folder rules: preserve original filenames when available, infer names from page metadata when URLs are opaque, and avoid overwriting with stable duplicate handling.
 - Shared archive manifest: record source URL, page URL, headers source, original filename, saved path, file size, checksum when practical, and retry status for archive and image downloads.
 - Internal rename cleanup: eventually rename package and scripts from `hls_keeper` / HLS Keeper to Web Keeper when it is worth the migration cost.
-- Chinese (zh-CN) UI localisation: translate the Dashboard and extension popup into Simplified Chinese, ideally behind a language toggle. The UI is currently Australian English only.
+- Broaden real-site fixtures and add focused adapters only where the generic parser and authorization refresh path cannot cover a site.
 - Study existing video downloader extensions for feature and UX reference, e.g. Video DownloadHelper and CocoCut: media detection UI on the toolbar icon (badge with candidate count), per-tab candidate lists, one-click quality pick, and broader site/format coverage.

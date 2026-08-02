@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "Web Keeper",
-  "version": "0.1.3",
-  "description": "Capture authorised HLS requests and send them to the local Web Keeper service.",
-  "permissions": ["webRequest", "alarms", "storage"],
-  "host_permissions": [
-    "<all_urls>",
-    "http://127.0.0.1:17888/*"
-  ],
+  "name": "__MSG_appName__",
+  "version": "0.3.6",
+  "description": "__MSG_appDescription__",
+  "default_locale": "zh_CN",
+  "incognito": "split",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6GW1vohXJ2MJWFs+K+tdufHgEKIgCZfdaYEOQnB87n2fTOcpguVWG3L/Fvm5rPJWT4vDxrHEi7riEuidbN8Odwv31xyuwOXdngVMQEFaWeOJfkNYP/p3gfX4vGAy8bpZxyDTMgvx1nRmHIwQ7mmjxU7R+VtOE3NxBwq3/GTZkSLMOQD2NVUlIyFj3lktFEAimYDRvNoMYWSbS7fbyZYhhZO07wwr5IUFa06gSR3I4qQGsI7KVQLtmWj/a1T2MAvTeT4SGpVJpGT+OLk6gR6aHuxMPvHgBjMzjYibnjA2AB5iqyOWg1C8/2jx61VKvgjZuAn+Jp5OdkMBjTx66XXCdQIDAQAB",
+  "permissions": ["webRequest", "storage", "activeTab", "scripting", "unlimitedStorage", "downloads"],
+  "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
   },

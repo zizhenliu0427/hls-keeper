@@ -1,6 +1,7 @@
 data/*
 !data/subtitle_dictionary.example.json
 outputs/
+dist/
 edge_profile/
 *.log
 *.part
@@ -18,3 +19,10 @@ __pycache__/
 .venv/
 venv/
 .env
+helper/
+extension/native-helper.js
+scripts/install-helper.ps1
+scripts/uninstall-helper.ps1
+node_modules/
+.pytest_cache/
+.coverage
