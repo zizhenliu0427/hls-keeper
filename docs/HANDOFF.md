@@ -1,5 +1,43 @@
 # Web Keeper 交接文档（Handoff）
 
+## 0.3.9 Capture 直取播放器数据 + DASH 辅助抓取（2026-08-04）
+
+### 直取播放器已经收到的数据（本轮最重要的改动）
+
+- 新增 `extension/page-capture.js`，在辅助抓取任务启动时通过 `chrome.scripting` 注入到视频页的 **MAIN world**（`allFrames`），包装 `fetch` 和 `XMLHttpRequest`，把播放器已经收到的媒体响应体保留在页面内（上限 96 MB / 单项 24 MB，按插入顺序淘汰）。任务页随后按 URL 取走这份字节。
+- 因此 Capture 不再必然“重新请求一遍”。一次性 URL、Referer/Origin、连接绑定、播放器私有 token 这些场景，只要播放器自己拿到了数据，就能保存下来。取不到时仍按原有顺序回落：任务页请求（优先浏览器缓存）→ 原网页会话内请求。
+- 时序注意：webRequest 是在**请求发出时**广播的，那一刻响应体还没到，所以取数据是轮询等待（250 ms 一次）。冷启动等 6 秒，命中过之后降到 2.5 秒；从没命中过且连续 3 次落空会关掉等待并记日志，命中后恢复。播放器 seek 取消掉的请求 body 永远不会到，所以等满一次的 URL 会记进 `pageBufferGaveUp`，之后只做零等待的一次性检查，避免智能补全时每片空等。
+- **这段轮询/退避逻辑没有自动化测试覆盖**，只有契约断言。它依赖 `chrome.scripting` 和完整 DOM，只能在真实浏览器里验；node 测试覆盖的是 `page-capture.js` 拦截器本身的行为。
+- 缓冲区留在页面里，所以任务页短暂关闭期间播放器收到的数据仍然在（只要标签页还在）。任务完成或从列表移除时会调用 `stop()` 还原 `fetch`/XHR 并清空缓冲。
+- 页面脚本全程 try/catch，任何异常都直接放行原始请求；只有用户明确对该标签页选择了辅助抓取才会注入。
+- **不使用 `chrome.debugger`**，因此不会出现调试横幅，也没有新增权限（`scripting` + `<all_urls>` 已有）。
+
+### 直播与滚动窗口
+
+- 直播不再自作主张合成：HLS `isLive` 和 DASH `type="dynamic"` 时不触发自动生成，改为持续保存并提示用户自己点「检查并生成视频」。此前直播的 `done >= total` 会在播放中途就把任务标成完成。
+- 动态 MPD 刷新改为累积合并（`mergeDashCaptureTracks`）：新窗口的分片追加到已知列表尾部，已保存分片的位置序号保持不变。此前刷新会重排位置，导致 `dash:<track>:<index>` 记录错位、文件互相覆盖。
+
+### DASH 辅助抓取
+
+- 网页辅助保存不再只支持 HLS。候选只有 MPD 时走 `runDashCapture`；HLS 路径在还没保存任何内容、又定位不到分片时会尝试 `switchCaptureToDash`，因此把 DASH 站点误判成 HLS 也能自动纠正。
+- `media-engine.js` 新增 `dashCaptureIndex`：把 MPD 里**所有** Representation 的分片和初始化段建成 URL 索引（全 URL 优先，无歧义 pathname 兜底），因此不需要预先猜播放器会用哪一档。
+- 播放器第一次请求到的视频轨和音频轨会被锁定为本任务轨道，轨道 id 存进 `state.dashTrackIds`，重开任务仍是同两条轨道；之后播放器切档只提示，不混轨。
+- 落盘、断点、合并复用既有 DASH 直接下载实现（`saveDashSegment` / `reconcileDashSaved` / `mergeDashOutput`），Capture 与直接下载共用同一套 `dash/<contentType_trackId>/` 目录和账本记录。
+- 缺片时间轴按锁定的视频轨计算，所以智能补全对 DASH 同样可用；动态 MPD 按 8 秒节流刷新。
+- `saveDashSegment` / `saveDashInitialization` 与 HLS 一样支持原网页会话回落和浏览器缓存优先（统一为 `fetchMediaBytes`）。
+- background 的无扩展名分片识别不再只看 HLS 上下文：manifest 请求同样标记该标签页，候选的 `manifestUrl(s)` 也算作流媒体上下文，manifest 事件也会进入 30 分钟请求队列。
+- 顺带修正：辅助抓取任务点「检查并生成视频」以前会调用 `runDirect()` 触发一次完整直接下载，现在直接合并已抓到的内容。`reconcileSaved` 也能按 `dash` / `hls-cmaf` 记录找到对应轨道目录，重开任务不再先显示 0。
+- 自动化测试 39 项通过，新增 DASH 索引与滚动窗口累积测试、页面直取拦截器行为测试（播放器仍能读到自己的响应、播放列表不缓冲、取走一次即释放、stop 后还原）。真实站点验收仍未做。
+
+## 0.3.8 Capture 清晰度跟随与会话内重试（2026-08-04）
+
+- 修正 0.3.7 引入的匹配收紧：`candidateId` 现在只作为命中条件，不再作为否决条件。之前分片 URL 带清晰度（候选 id 为 `tab:product:720x404`）而任务候选是 `tab:product:auto` 时，全部分片事件会被静默丢弃。
+- Capture 在还没有保存任何分片之前，会按观察到的分片 URL 反查真正在播的清晰度列表（含 master 里的 variants 和音轨），命中后固定使用该列表。保存第一个分片后播放列表锁定，播放器再切清晰度只提示不切换，避免把两种分辨率混进同一个成品。
+- 分片定位逻辑移入 `media-engine.js` 的 `segmentLookup`：先全 URL 精确匹配，再无歧义 pathname，最后才允许按序号兜底，且序号兜底要求 URL 与播放列表在同一目录。此前不同清晰度的同序号分片会被写成同一片。
+- 暂时对不上播放列表的分片不再丢弃，会进入待处理队列（上限 300），在播放列表刷新或成功保存后重放。播放列表刷新做了 4 秒节流，滚动直播列表不会每次请求都全量重读。
+- 任务页请求失败（一次性 URL、Referer/Origin、连接绑定）时，改用 `chrome.scripting` 在原视频页会话内 fetch 该分片并回传字节；页面已关闭或同样失败时保持原有报错。Capture 的分片请求同时改为 `cache: "force-cache"`，可直接复用播放器刚产生的浏览器缓存。
+- 自动化测试 34 项通过，新增分片定位（query-only URL、跨清晰度拒绝、带 token 的同名 URL）与 Capture 契约测试。真实目标站点验收仍未做。
+
 ## 0.3.7 Capture 可靠性补强与真实边界（2026-08-04）
 
 - 当前 Capture 的准确定位是“普通单轨 VOD HLS 可试用的纯扩展 MVP”，不是适用于任意媒体协议的通用响应截获器。直接文件和 DASH 仍应优先使用直接下载；DASH Capture、复杂独立音轨、直播滚动窗口、严格一次性 URL 尚未完成。

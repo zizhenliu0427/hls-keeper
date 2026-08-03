@@ -1,6 +1,6 @@
 ﻿# Web Keeper
 
-> Current extension development version: **0.3.7**
+> Current extension development version: **0.3.9**
 
 Web Keeper is a browser-first HLS discovery, direct-download, and assisted-capture tool. The main video flow now runs entirely inside the extension; the legacy Python Dashboard remains available for existing captures, native ffmpeg workflows, and Archive jobs.
 
@@ -80,18 +80,26 @@ Settings can switch the destination to a custom folder. Chromium may reject syst
 The extension has one listening switch. Discovery never starts a download by itself. After a candidate is found, choose:
 
 - **Direct download (recommended):** parse the playlist, save missing segments with checkpoints, decrypt ordinary AES-128 HLS, and generate a `.ts` or fragmented `.mp4` output.
-- **Browser-assisted capture:** conservatively save only HLS segments actually requested by the player. Keep the task page open for reliable capture and continue playback. If it closes briefly, recent request metadata is queued for a best-effort retry when the task reopens; browser response bodies are not cached.
+- **Browser-assisted capture:** conservatively save only the HLS or DASH segments actually requested by the player. Keep the task page open for reliable capture and continue playback. If it closes briefly, recent request metadata is queued for a best-effort retry when the task reopens; browser response bodies are not cached.
 - **Ignore this time:** do not create a task.
 
 The extension never scans or modifies the existing `data/captures` tree. Each new task uses a private resumable workspace or a user-approved custom folder. Temporary HLS pieces have a separate cleanup action. Tasks can also be removed from the download-centre list without deleting saved files or resumable content.
 
 Browser-assisted tasks show missing time ranges. The user-triggered gap filler seeks only those ranges, slows down when the player is not ready, and stops after repeated lack of progress.
 
-Capture is currently an HLS-oriented fallback, not a general network-response recorder. One-time URLs, strict playback-session binding, DASH capture, and complex separate-track/live streams still require further validation or adaptation.
+Capture follows the quality the player actually uses: while nothing has been saved yet, it switches to the variant playlist that contains the observed segments. Once the first segment is saved the playlist is fixed, so a later quality switch in the player is reported instead of mixing resolutions into one file. Segments that cannot be placed yet are kept and retried after the next playlist update. When the task page cannot fetch a segment itself, it retries the request inside the original page session, which carries that page's cookies, referrer, and origin.
+
+DASH capture works the same way from the MPD: every representation is indexed up front, the first representation the player requests for video and for audio is locked for the task, and both tracks are checkpointed separately and combined into one CMAF MP4. The locked representations are stored with the task, so reopening it keeps the same tracks.
+
+Once assisted saving starts, Web Keeper keeps the media bytes the player already received inside the video page (about 96 MB at most) and saves those bytes directly, falling back to a fresh request only when they are not available. One-time URLs and session-bound authorisation therefore usually succeed. This only covers playback after the task starts: anything played earlier has to be played again. The page is restored and the buffer cleared when the task completes or is removed.
+
+Live streams (a live HLS playlist or a `type="dynamic"` MPD) never finalise on their own; they keep saving until you choose Check and create video.
+
+Capture is still a stream-oriented fallback, not a general network-response recorder. Multi-period DASH and complex separate-track streams still require further validation or adaptation.
 
 ## Local Release Package
 
-The development package is `dist/Web-Keeper-0.3.7.zip`. Extract it, enable Developer mode in Edge/Chrome, and choose **Load unpacked**. The archive excludes the experimental Helper and does not require the Python service. The recommended destination uses the browser Downloads API, so it can save to the normal Downloads folder without granting that folder through the File System Access picker.
+The development package is `dist/Web-Keeper-0.3.9.zip`. Extract it, enable Developer mode in Edge/Chrome, and choose **Load unpacked**. The archive excludes the experimental Helper and does not require the Python service. The recommended destination uses the browser Downloads API, so it can save to the normal Downloads folder without granting that folder through the File System Access picker.
 
 After changing extension files, reload the extension in Edge/Chrome.
 

@@ -22,7 +22,23 @@ class ExtensionContractTests(unittest.TestCase):
         self.assertEqual("zh_CN", manifest["default_locale"])
         self.assertEqual("split", manifest["incognito"])
         self.assertEqual("__MSG_appName__", manifest["name"])
-        self.assertEqual("0.3.7", manifest["version"])
+        self.assertEqual("0.3.9", manifest["version"])
+
+    def test_declared_icons_exist_at_their_declared_size(self) -> None:
+        manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
+        declared = {**manifest["icons"], **manifest["action"]["default_icon"]}
+        self.assertEqual({"16", "24", "32", "48", "128"}, set(declared))
+        for size, relative in declared.items():
+            path = ROOT / "extension" / relative
+            # A manifest pointing at a missing icon makes the whole extension fail to load.
+            self.assertTrue(path.is_file(), f"missing icon: {relative}")
+            header = path.read_bytes()[:24]
+            self.assertEqual(b"\x89PNG\r\n\x1a\n", header[:8], f"not a PNG: {relative}")
+            width = int.from_bytes(header[16:20], "big")
+            height = int.from_bytes(header[20:24], "big")
+            self.assertEqual((int(size), int(size)), (width, height), f"wrong size: {relative}")
+        package = (ROOT / "scripts" / "package_extension.ps1").read_text(encoding="utf-8")
+        self.assertIn('"icons",', package)
 
     def test_popup_does_not_load_native_helper(self) -> None:
         html = (ROOT / "extension" / "popup.html").read_text(encoding="utf-8")
@@ -197,6 +213,111 @@ setTimeout(() => {
         self.assertIn('state.mode = "browser-assisted"', script)
         self.assertNotIn("nativeMessaging", script)
 
+    def test_capture_recovers_quality_switches_and_session_bound_segments(self) -> None:
+        download = (ROOT / "extension" / "download.js").read_text(encoding="utf-8")
+        engine = (ROOT / "extension" / "media-engine.js").read_text(encoding="utf-8")
+        self.assertIn("function segmentLookup", engine)
+        self.assertIn("async function adoptPlaylistForSegment", download)
+        self.assertIn("async function locateCaptureSegment", download)
+        self.assertIn("function deferCaptureSegment", download)
+        self.assertIn("async function replayPendingCaptureSegments", download)
+        self.assertIn("async function fetchSegmentInPage", download)
+        self.assertIn('cacheMode: "force-cache"', download)
+        self.assertIn("capturePlaylistLocked = Number(state.done || 0) > 0", download)
+        self.assertIn("captureQualityAdopted", download)
+        self.assertIn("captureQualityChanged", download)
+        # A locked task must never adopt another quality, otherwise the output mixes resolutions.
+        self.assertIn("if (!capturePlaylistLocked && await adoptPlaylistForSegment(event.url))", download)
+
+    def test_dash_capture_locks_one_representation_per_track(self) -> None:
+        download = (ROOT / "extension" / "download.js").read_text(encoding="utf-8")
+        engine = (ROOT / "extension" / "media-engine.js").read_text(encoding="utf-8")
+        background = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        self.assertIn("function dashCaptureIndex", engine)
+        self.assertIn("async function runDashCapture", download)
+        self.assertIn("async function captureObservedDashSegment", download)
+        self.assertIn("async function lockDashTrack", download)
+        self.assertIn("async function switchCaptureToDash", download)
+        self.assertIn("async function refreshDashCaptureManifest", download)
+        self.assertIn("async function finalizeDashCapture", download)
+        self.assertIn("if (captureUsesDash()) return runDashCapture();", download)
+        self.assertIn("if (dashCapture) return captureObservedDashSegment(event);", download)
+        # The selected representations must survive a task page restart.
+        self.assertIn("state.dashTrackIds", download)
+        # Discovery of extensionless segments must work on DASH pages too, not only HLS ones.
+        self.assertIn('["playlist", "manifest"].includes(kind)', background)
+        self.assertIn('["playlist", "manifest", "segment"].includes(observed.kind)', background)
+        self.assertIn("hasRecentStream", background)
+
+    def test_page_capture_hook_buffers_player_responses(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is not available")
+        source = r"""
+global.window = global;
+window.location = { href: 'https://watch.example/video' };
+const served = new Uint8Array([0x47, 0x40, 0x11, 0x10, 0x42, 0x43]);
+window.fetch = async (url) => {
+  const playlist = String(url).includes('.m3u8');
+  return new Response(playlist ? '#EXTM3U' : served, { headers: { 'content-type': playlist ? 'application/vnd.apple.mpegurl' : 'video/mp2t' } });
+};
+require('./extension/page-capture.js');
+(async () => {
+  const playlist = await window.fetch('https://cdn.example/index.m3u8');
+  const response = await window.fetch('https://cdn.example/chunk?id=7');
+  const playerCopy = new Uint8Array(await response.arrayBuffer());
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const api = window.__webKeeperCapture;
+  const buffered = api.take('https://cdn.example/chunk?id=7');
+  const second = api.take('https://cdn.example/chunk?id=7');
+  const statsBeforeStop = api.stats();
+  api.stop();
+  console.log(JSON.stringify({
+    playerStillReadable: Array.from(playerCopy),
+    buffered: buffered ? Array.from(buffered) : null,
+    takenTwice: second,
+    emptyAfterTake: statsBeforeStop.count,
+    playlistBuffered: api.take('https://cdn.example/index.m3u8') !== null,
+    hookRemoved: window.__webKeeperCapture === undefined,
+    fetchRestored: typeof window.fetch === 'function',
+    playlistStatus: playlist.status
+  }));
+})();
+"""
+        completed = subprocess.run([node, "-e", source], cwd=ROOT, check=True, capture_output=True, text=True, encoding="utf-8")
+        result = json.loads(completed.stdout)
+        # The player must still be able to read its own response body.
+        self.assertEqual([0x47, 0x40, 0x11, 0x10, 0x42, 0x43], result["playerStillReadable"])
+        self.assertEqual([0x47, 0x40, 0x11, 0x10, 0x42, 0x43], result["buffered"])
+        self.assertIsNone(result["takenTwice"])
+        self.assertEqual(0, result["emptyAfterTake"])
+        self.assertFalse(result["playlistBuffered"])
+        self.assertTrue(result["hookRemoved"])
+        self.assertTrue(result["fetchRestored"])
+
+    def test_capture_prefers_bytes_the_player_already_received(self) -> None:
+        download = (ROOT / "extension" / "download.js").read_text(encoding="utf-8")
+        hook = (ROOT / "extension" / "page-capture.js").read_text(encoding="utf-8")
+        package = (ROOT / "scripts" / "package_extension.ps1").read_text(encoding="utf-8")
+        self.assertIn("window.__webKeeperCapture", hook)
+        self.assertIn("response.clone().arrayBuffer()", hook)
+        self.assertIn("window.XMLHttpRequest = PatchedXhr", hook)
+        self.assertIn("MAX_TOTAL_BYTES", hook)
+        self.assertIn("async function ensurePageCaptureHook", download)
+        self.assertIn("async function takeBufferedSegment", download)
+        self.assertIn("async function stopPageCaptureHook", download)
+        self.assertIn('world: "MAIN", files: ["page-capture.js"]', download)
+        self.assertIn("preferPageBuffer: true", download)
+        # The observed event fires when the request starts, so the body needs a bounded wait.
+        self.assertIn("const bytes = await readBufferedSegment(tabId, url);", download)
+        self.assertIn("if (paused || Date.now() >= deadline) return null;", download)
+        # A request the player cancelled must never consume the wait twice.
+        self.assertIn("pageBufferGaveUp.has(url) ? 0 : pageBufferWaitMs", download)
+        # A live stream never ends by itself, so it must not finalise on its own.
+        self.assertIn("if (!state.isLive && state.total && state.done >= state.total && autoFinalize)", download)
+        self.assertIn('const isLive = dashCapture.manifest.type === "dynamic"', download)
+        self.assertIn('"page-capture.js",', package)
+
     def test_media_provider_registry_and_direct_range_resume_exist(self) -> None:
         engine = (ROOT / "extension" / "media-engine.js").read_text(encoding="utf-8")
         download = (ROOT / "extension" / "download.js").read_text(encoding="utf-8")
@@ -227,7 +348,7 @@ setTimeout(() => {
         self.assertIn("patchMp4InitDuration", download)
         self.assertIn('const MEDIA_EVENTS_KEY = "wkMediaEvents"', background)
         self.assertIn("replayQueuedCaptureEvents", download)
-        self.assertIn("playlistByUrl", download)
+        self.assertIn("WebKeeperMediaEngine.segmentLookup", download)
         self.assertIn("playlistUrls", background)
         self.assertIn("directFiles", background)
 

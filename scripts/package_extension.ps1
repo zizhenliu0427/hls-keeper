@@ -19,6 +19,7 @@ $packageItems = @(
     "background.js",
     "i18n.js",
     "media-engine.js",
+    "page-capture.js",
     "popup.html",
     "popup.js",
     "download.html",
@@ -26,6 +27,7 @@ $packageItems = @(
     "settings.html",
     "settings.js",
     "vendor",
+    "icons",
     "_locales"
 ) | ForEach-Object { Join-Path $extensionDirectory $_ }
 

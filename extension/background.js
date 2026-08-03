@@ -1,4 +1,4 @@
-const SCRIPT_VERSION = "web-keeper-extension-0.3.7";
+const SCRIPT_VERSION = "web-keeper-extension-0.3.9";
 const CANDIDATES_KEY = "wkCandidates";
 const JOBS_KEY = "wkJobs";
 const MEDIA_EVENTS_KEY = "wkMediaEvents";
@@ -8,7 +8,7 @@ const MAX_MEDIA_EVENTS = 600;
 const MEDIA_EVENT_TTL_MS = 30 * 60 * 1000;
 let candidateWriteChain = Promise.resolve();
 const pendingMediaHeaders = new Map();
-const recentHlsTabs = new Map();
+const recentStreamTabs = new Map();
 
 function mediaKind(url, requestType = "") {
   try {
@@ -135,7 +135,7 @@ function broadcastMedia(event) {
 function queuedMediaEvents(events, observed, candidateId) {
   const now = Date.now();
   const recent = (Array.isArray(events) ? events : []).filter((item) => Number(item.timeStamp || 0) >= now - MEDIA_EVENT_TTL_MS);
-  if (!["playlist", "segment"].includes(observed.kind)) return recent.slice(-MAX_MEDIA_EVENTS);
+  if (!["playlist", "manifest", "segment"].includes(observed.kind)) return recent.slice(-MAX_MEDIA_EVENTS);
   const queued = {
     ...observed,
     id: `${observed.tabId}:${observed.kind}:${observed.timeStamp}:${observed.url}`,
@@ -150,7 +150,7 @@ async function recordCandidate(details, forcedKind = "") {
   if (String(details.initiator || "").startsWith(`chrome-extension://${chrome.runtime.id}`)) return;
   const kind = forcedKind || mediaKind(details.url, details.type);
   if (!kind) return;
-  if (kind === "playlist" && details.tabId >= 0) recentHlsTabs.set(details.tabId, Date.now());
+  if (["playlist", "manifest"].includes(kind) && details.tabId >= 0) recentStreamTabs.set(details.tabId, Date.now());
   const { discover = false } = await chrome.storage.local.get({ discover: false });
   if (!discover) return;
   const context = await tabContext(details.tabId);
@@ -329,15 +329,15 @@ async function recordResponseCandidate(details) {
   if (obviousSegment) return;
   const stored = await chrome.storage.local.get({ [CANDIDATES_KEY]: [] });
   const now = Date.now();
-  const hasRecentHls = Number(recentHlsTabs.get(details.tabId) || 0) >= now - 10 * 60 * 1000 || (stored[CANDIDATES_KEY] || []).some((item) => Number(item.tabId) === Number(details.tabId)
+  const hasRecentStream = Number(recentStreamTabs.get(details.tabId) || 0) >= now - 10 * 60 * 1000 || (stored[CANDIDATES_KEY] || []).some((item) => Number(item.tabId) === Number(details.tabId)
     && Number(item.lastSeen || 0) >= now - 10 * 60 * 1000
-    && Boolean(item.playlistUrl || (item.playlistUrls || []).length));
+    && Boolean(item.playlistUrl || (item.playlistUrls || []).length || item.manifestUrl || (item.manifestUrls || []).length));
   const hasMediaExtension = /\.(?:mp4|webm|mkv|mov|m4v|mp3|m4a|flac|ogg|wav)(?:[?#]|$)/i.test(details.url);
   const strongSegmentMime = /(?:video\/(?:mp2t|iso\.segment)|audio\/aac)/i.test(contentType);
   const segmentMime = strongSegmentMime || /(?:video\/mp4|audio\/mp4|application\/(?:octet-stream|mp4))/i.test(contentType);
   const headers = responseHeaderObject(details);
   const size = responseSize(headers);
-  const likelyExtensionlessSegment = hasRecentHls && !hasMediaExtension && segmentMime
+  const likelyExtensionlessSegment = hasRecentStream && !hasMediaExtension && segmentMime
     && (details.type !== "media" || strongSegmentMime) && (!size || (size >= 16 && size <= 64 * 1024 * 1024));
   if (likelyExtensionlessSegment) return recordCandidate(enriched, "segment");
 

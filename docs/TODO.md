@@ -45,8 +45,13 @@
   - [x] 浏览器辅助模式跟随实际请求，移除 Helper 前置与 burst-ahead  
   - [x] 任务页意外关闭后恢复为明确的暂停状态；background 暂存近期请求元数据供重开补处理  
   - [x] 无扩展名 HLS playlist/segment 按 Content-Type 和近期 HLS 上下文识别  
-  - [ ] Capture 迁入可持续运行的扩展执行上下文；当前任务页关闭时不保存响应体，只能稍后重请求  
-  - [ ] DASH、复杂独立音轨和直播滚动 playlist 的 Capture 适配  
+  - [x] Capture 跟随播放器实际清晰度：保存前可切换 variant，保存后锁定并提示，不混合分辨率  
+  - [x] 无法定位的分片进入待重试队列，在播放列表刷新或下次成功保存后重放  
+  - [x] 任务页请求失败时改在原网页会话内取分片（Referer/Origin/Cookie 随页面），并优先复用浏览器缓存  
+  - [x] DASH Capture：按 MPD 索引全部 Representation，锁定播放器实际使用的音视频轨并合并成 CMAF MP4  
+  - [x] Capture 直取播放器已收到的响应体（页面内 MAIN world 拦截 fetch/XHR，上限 96 MB），不再必然重新请求  
+  - [x] 直播不再自动合成；DASH 动态清单刷新按累积合并，已保存分片位置不变  
+  - [ ] 多 Period DASH 与复杂独立音轨的 Capture 适配  
   - 浏览器内完成常见 HLS remux/mux，复杂转码不作为 MVP 前置条件  
   - 在真实目标站点记录 401/403/404/429、响应大小、Token 变化和播放器状态，区分 API 边界与抓取策略问题  
   - 未安装 Helper 也能完成核心流程
@@ -145,7 +150,7 @@
 ## 改动时顺手记（非独立需求，但常踩坑）
 
 - [x] Capture 移除 `burst-ahead`，按任务单队列跟随播放器实际请求  
-- [ ] Capture 严格会话站点适配：一次性 URL、Referer/Origin、连接绑定与播放器私有 token  
+- [ ] Capture 严格会话站点适配：已能直取播放器收到的数据，覆盖一次性 URL 与私有 token；仍需真实站点验收，且注入前已经播过的分片取不到  
 - [ ] `state` 持久化勿再做成频繁全量巨型 JSON（可考虑 sqlite / 分文件）  
 - [ ] `/api/status` 保持轻量；全量扫盘仅手动或低频缓存  
 - [ ] Merge 与 Direct download 的产品文案/引导做清楚  

@@ -585,6 +585,113 @@
     return "NETWORK_ERROR";
   }
 
+  function normalizeMediaUrl(value) {
+    try {
+      const url = new URL(value);
+      url.hash = "";
+      return url.href;
+    } catch { return String(value || ""); }
+  }
+
+  function urlDirectory(value) {
+    try {
+      const url = new URL(value);
+      return `${url.origin}${url.pathname.replace(/[^/]*$/, "")}`;
+    } catch { return ""; }
+  }
+
+  function sequenceFromUrl(value) {
+    try {
+      const name = new URL(value).pathname.split("/").pop() || "";
+      const match = name.match(/(?:^|[_-])(\d{1,10})(?:\.[a-z0-9]+)?$/i) || name.match(/(\d{1,10})/);
+      return match ? Number(match[1]) : null;
+    } catch { return null; }
+  }
+
+  function segmentLookup(segments = []) {
+    const byUrl = new Map();
+    const byPath = new Map();
+    for (const item of segments) {
+      byUrl.set(normalizeMediaUrl(item.url), item);
+      let path = "";
+      try { path = new URL(item.url).pathname; } catch { path = ""; }
+      if (!path) continue;
+      byPath.set(path, byPath.has(path) ? null : item);
+    }
+    const reference = segments.find((item) => item?.url)?.url || "";
+    function exact(url) {
+      let path = "";
+      try { path = new URL(url).pathname; } catch { path = ""; }
+      return byUrl.get(normalizeMediaUrl(url)) || (path ? byPath.get(path) : null) || null;
+    }
+    function sameLocation(url) {
+      const directory = urlDirectory(url);
+      return Boolean(directory) && directory === urlDirectory(reference);
+    }
+    function find(url) {
+      const known = exact(url);
+      if (known) return known;
+      if (!sameLocation(url)) return null;
+      const sequence = sequenceFromUrl(url);
+      return sequence == null ? null : segments.find((item) => item.sequence === sequence) || null;
+    }
+    return { exact, sameLocation, find };
+  }
+
+  function mergeDashCaptureTracks(previousTracks = [], nextTracks = []) {
+    const previousById = new Map(previousTracks.map((track) => [track.id, track]));
+    const merged = nextTracks.map((track) => {
+      const previous = previousById.get(track.id);
+      if (!previous?.segments?.length) return track;
+      const segments = [...previous.segments];
+      const known = new Set(segments.map((segment) => normalizeMediaUrl(segment.url)));
+      for (const segment of track.segments) {
+        const key = normalizeMediaUrl(segment.url);
+        if (known.has(key)) continue;
+        known.add(key);
+        segments.push(segment);
+      }
+      return { ...track, segments };
+    });
+    const carried = previousTracks.filter((track) => !merged.some((item) => item.id === track.id));
+    return [...merged, ...carried];
+  }
+
+  function dashCaptureIndex(manifest) {
+    const tracks = (manifest?.tracks || []).filter((track) => ["video", "audio"].includes(track.contentType) && track.segments.length);
+    const byUrl = new Map();
+    const byPath = new Map();
+    const rememberPath = (url, entry) => {
+      let path = "";
+      try { path = new URL(url).pathname; } catch { path = ""; }
+      if (!path) return;
+      byPath.set(path, byPath.has(path) ? null : entry);
+    };
+    for (const track of tracks) {
+      if (track.initializationUrl) {
+        const entry = { trackId: track.id, index: -1, kind: "initialization" };
+        byUrl.set(normalizeMediaUrl(track.initializationUrl), entry);
+        rememberPath(track.initializationUrl, entry);
+      }
+      track.segments.forEach((segment, index) => {
+        const entry = { trackId: track.id, index, kind: "segment" };
+        byUrl.set(normalizeMediaUrl(segment.url), entry);
+        rememberPath(segment.url, entry);
+      });
+    }
+    function find(url) {
+      const exact = byUrl.get(normalizeMediaUrl(url));
+      if (exact) return exact;
+      let path = "";
+      try { path = new URL(url).pathname; } catch { path = ""; }
+      return (path ? byPath.get(path) : null) || null;
+    }
+    function track(trackId) {
+      return tracks.find((item) => item.id === trackId) || null;
+    }
+    return { tracks, find, track };
+  }
+
   function missingTimeline(segments, savedSequences) {
     const saved = savedSequences instanceof Set ? savedSequences : new Set(savedSequences || []);
     const missing = (segments || []).filter((item) => !item.gap && !saved.has(item.sequence)).sort((a, b) => a.sequence - b.sequence);
@@ -785,7 +892,7 @@
     isoDurationSeconds, expandDashTimeline, parseDashManifest, selectDashTracks,
     mp4Boxes, concatBytes, makeMp4Box, mergeCmafInitializations, patchCmafFragmentTrackId, patchMp4InitDuration,
     mp4TrackTypes, inspectTransportStream, inspectMediaBytes,
-    classifyMediaError, missingTimeline,
+    classifyMediaError, missingTimeline, normalizeMediaUrl, sequenceFromUrl, segmentLookup, dashCaptureIndex, mergeDashCaptureTracks,
     extensionFromUrl, extensionForCandidate, directFile, directFileUrl
   };
   root.WebKeeperMediaEngine = api;

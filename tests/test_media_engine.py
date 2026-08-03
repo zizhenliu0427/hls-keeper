@@ -123,6 +123,74 @@ console.log(JSON.stringify({p, selected}));
         self.assertEqual("audio", result["selected"][1]["id"])
         self.assertEqual("https://example.test/path/cdn/a/001.m4s", result["selected"][1]["segments"][0]["url"])
 
+    def test_dash_capture_index_maps_observed_requests_to_representations(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const text = `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT10S">
+  <BaseURL>cdn/</BaseURL>
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate timescale="1000" initialization="v/$RepresentationID$/init.mp4" media="v/$RepresentationID$/$Time$.m4s">
+        <SegmentTimeline><S t="0" d="2000" r="4"/></SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="720" bandwidth="2000000" width="1280" height="720" codecs="avc1.64001f"/>
+      <Representation id="1080" bandwidth="4000000" width="1920" height="1080" codecs="avc1.640028"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" lang="zh">
+      <SegmentTemplate timescale="48000" duration="96000" startNumber="1" initialization="a/init.mp4" media="a/$Number%03d$.m4s"/>
+      <Representation id="audio" bandwidth="128000" codecs="mp4a.40.2"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`;
+const index = e.dashCaptureIndex(e.parseDashManifest(text, 'https://example.test/path/manifest.mpd'));
+console.log(JSON.stringify({
+  trackCount: index.tracks.length,
+  lowQuality: index.find('https://example.test/path/cdn/v/720/4000.m4s'),
+  highQuality: index.find('https://example.test/path/cdn/v/1080/4000.m4s'),
+  withToken: index.find('https://example.test/path/cdn/a/002.m4s?token=fresh'),
+  initialization: index.find('https://example.test/path/cdn/a/init.mp4'),
+  unrelated: index.find('https://other.test/ads/clip.m4s'),
+  audioContentType: index.track('audio')?.contentType ?? null
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual(3, result["trackCount"])
+        self.assertEqual({"trackId": "720", "index": 2, "kind": "segment"}, result["lowQuality"])
+        self.assertEqual({"trackId": "1080", "index": 2, "kind": "segment"}, result["highQuality"])
+        self.assertEqual({"trackId": "audio", "index": 1, "kind": "segment"}, result["withToken"])
+        self.assertEqual("initialization", result["initialization"]["kind"])
+        self.assertIsNone(result["unrelated"])
+        self.assertEqual("audio", result["audioContentType"])
+
+    def test_dash_capture_tracks_keep_positions_when_the_window_moves(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const previous = [{ id: 'v', contentType: 'video', segments: [
+  { url: 'https://cdn.test/v/1.m4s' }, { url: 'https://cdn.test/v/2.m4s' }, { url: 'https://cdn.test/v/3.m4s' }
+] }];
+const refreshed = [{ id: 'v', contentType: 'video', segments: [
+  { url: 'https://cdn.test/v/3.m4s' }, { url: 'https://cdn.test/v/4.m4s' }, { url: 'https://cdn.test/v/5.m4s' }
+] }, { id: 'a', contentType: 'audio', segments: [{ url: 'https://cdn.test/a/1.m4s' }] }];
+const merged = e.mergeDashCaptureTracks(previous, refreshed);
+const index = e.dashCaptureIndex({ tracks: merged });
+console.log(JSON.stringify({
+  urls: merged[0].segments.map((item) => item.url),
+  firstStillIndexZero: index.find('https://cdn.test/v/1.m4s'),
+  newSegment: index.find('https://cdn.test/v/5.m4s'),
+  audioKept: merged[1].segments.length
+}));
+"""
+        result = self.run_node(source)
+        # A rolling window must not renumber segments that were already saved.
+        self.assertEqual(
+            [f"https://cdn.test/v/{number}.m4s" for number in (1, 2, 3, 4, 5)],
+            result["urls"],
+        )
+        self.assertEqual({"trackId": "v", "index": 0, "kind": "segment"}, result["firstStillIndexZero"])
+        self.assertEqual({"trackId": "v", "index": 4, "kind": "segment"}, result["newSegment"])
+        self.assertEqual(1, result["audioKept"])
+
     def test_dash_parser_detects_drm(self) -> None:
         source = r"""
 const e = require('./extension/media-engine.js');
@@ -227,6 +295,40 @@ console.log(JSON.stringify(e.missingTimeline(segments, new Set([10, 13, 15]))));
         self.assertEqual(2, len(result))
         self.assertEqual({"sequenceFrom": 11, "sequenceTo": 12, "startSeconds": 4, "endSeconds": 12, "count": 2}, result[0])
         self.assertEqual(14, result[1]["sequenceFrom"])
+
+    def test_segment_lookup_separates_query_only_urls_and_refuses_other_qualities(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const queryOnly = e.parseHlsPlaylist(`#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXTINF:4,
+chunk?id=1
+#EXTINF:4,
+chunk?id=2
+#EXT-X-ENDLIST`, 'https://cdn.test/480p/index.m3u8');
+const named = e.parseHlsPlaylist(`#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXTINF:4,
+seg_0.ts
+#EXTINF:4,
+seg_1.ts
+#EXT-X-ENDLIST`, 'https://cdn.test/480p/index.m3u8');
+const byQuery = e.segmentLookup(queryOnly.segments);
+const byName = e.segmentLookup(named.segments);
+console.log(JSON.stringify({
+  exactQuery: byQuery.exact('https://cdn.test/480p/chunk?id=2')?.sequence ?? null,
+  otherQuality: byQuery.find('https://cdn.test/720p/chunk?id=2'),
+  otherQualitySameName: byName.find('https://cdn.test/720p/seg_1.ts'),
+  freshToken: byName.find('https://cdn.test/480p/seg_1.ts?token=late')?.sequence ?? null,
+  unlistedNeighbour: byName.find('https://cdn.test/480p/seg_1.ts')?.sequence ?? null
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual(1, result["exactQuery"])
+        self.assertIsNone(result["otherQuality"])
+        self.assertIsNone(result["otherQualitySameName"])
+        self.assertEqual(1, result["freshToken"])
+        self.assertEqual(1, result["unlistedNeighbour"])
 
     def test_direct_candidate_prefers_complete_video_over_audio(self) -> None:
         source = r"""

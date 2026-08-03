@@ -2,6 +2,8 @@ const CANDIDATES_KEY = "wkCandidates";
 const JOBS_KEY = "wkJobs";
 const MEDIA_EVENTS_KEY = "wkMediaEvents";
 const DB_NAME = "web-keeper-downloads";
+const PAGE_BUFFER_WAIT_COLD_MS = 6000;
+const PAGE_BUFFER_WAIT_PROVEN_MS = 2500;
 const DB_VERSION = 1;
 const query = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
@@ -19,8 +21,21 @@ const activeControllers = new Set();
 let captureQueue = Promise.resolve();
 let mediaPlaylist = null;
 let hlsAudioPlaylist = null;
-let playlistByPath = new Map();
-let playlistByUrl = new Map();
+let segmentIndex = WebKeeperMediaEngine.segmentLookup([]);
+let knownPlaylistSources = [];
+let pinnedPlaylistUrl = "";
+let pendingCaptureSegments = [];
+let replayingCaptureSegments = false;
+let capturePlaylistLocked = false;
+let qualitySwitchReportedAt = 0;
+let lastCaptureRefreshAt = 0;
+let lastAdoptAttemptAt = 0;
+let lastDashSwitchAt = 0;
+let lastHookInjectionAt = 0;
+let pageBufferWaitMs = PAGE_BUFFER_WAIT_COLD_MS;
+let pageBufferMisses = 0;
+let pageBufferGaveUp = new Set();
+let dashCapture = null;
 let logs = [];
 let showDiagnostics = false;
 const responseControllers = new WeakMap();
@@ -175,11 +190,7 @@ function validSubtitleUrls(urls = []) {
 }
 
 function normalizedMediaUrl(value) {
-  try {
-    const url = new URL(value);
-    url.hash = "";
-    return url.href;
-  } catch { return String(value || ""); }
+  return WebKeeperMediaEngine.normalizeMediaUrl(value);
 }
 
 function escapeHtml(value) {
@@ -306,7 +317,7 @@ function byteRangeHeader(value) {
   return WebKeeperMediaEngine.rangeHeader(value);
 }
 
-async function fetchResponse(url, { byteRange = "", attempts = 3, headers = {} } = {}) {
+async function fetchResponse(url, { byteRange = "", attempts = 3, headers = {}, cacheMode = "no-store" } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     if (paused) throw new Error(t("downloadPausedError", null, "下载已暂停"));
@@ -320,7 +331,7 @@ async function fetchResponse(url, { byteRange = "", attempts = 3, headers = {} }
         method: "GET",
         headers: allowedHeaders({ ...(candidate?.headers || {}), ...headers }, range ? { range } : {}),
         credentials: "include",
-        cache: "no-store",
+        cache: range ? "no-store" : cacheMode,
         signal: controller.signal
       });
       if (!response.ok) {
@@ -365,8 +376,22 @@ function targetHeight(resolution) {
   return Number(String(resolution || "").match(/\d+x(\d+)/)?.[1] || String(resolution || "").match(/(\d+)p/)?.[1] || 0);
 }
 
+function indexMediaPlaylist(parsed) {
+  mediaPlaylist = parsed;
+  segmentIndex = WebKeeperMediaEngine.segmentLookup(parsed.segments);
+  state.total = parsed.segments.filter((item) => !item.gap).length;
+  state.duration = parsed.duration || state.duration || 0;
+  state.isLive = parsed.isLive;
+  state.wasLive = Boolean(state.wasLive || parsed.isLive);
+}
+
+function rememberPlaylistSources(parsed) {
+  const discovered = [...(parsed.variants || []).map((item) => item.url), ...(parsed.audios || []).map((item) => item.url)];
+  knownPlaylistSources = Array.from(new Set([...knownPlaylistSources, ...discovered.filter(Boolean)])).slice(-40);
+}
+
 async function loadMediaPlaylist() {
-  const urls = Array.from(new Set([...(candidate.playlistUrls || []), candidate.playlistUrl].filter(Boolean)));
+  const urls = pinnedPlaylistUrl ? [pinnedPlaylistUrl] : Array.from(new Set([...(candidate.playlistUrls || []), candidate.playlistUrl].filter(Boolean)));
   if (!urls.length && candidate.segmentUrl) {
     const parsed = new URL(candidate.segmentUrl);
     parsed.pathname = parsed.pathname.replace(/\/[^/]+$/, "/first.m3u8");
@@ -397,6 +422,7 @@ async function loadMediaPlaylist() {
   candidate.playlistUrl = url;
   hlsAudioPlaylist = null;
   let discoveredSubtitles = [...(parsed.subtitles || [])];
+  rememberPlaylistSources(parsed);
   if (parsed.variants.length) {
     const wanted = targetHeight(candidate.resolution);
     const ordered = [...parsed.variants].sort((a, b) => targetHeight(b.resolution) - targetHeight(a.resolution) || b.bandwidth - a.bandwidth);
@@ -415,17 +441,7 @@ async function loadMediaPlaylist() {
   if (!parsed.segments.length) throw new Error(t("playlistEmpty", null, "没有找到可下载的视频内容。"));
   discoveredSubtitles = [...discoveredSubtitles, ...(parsed.subtitles || [])];
   candidate.subtitles = Array.from(new Set([...(candidate.subtitles || []), ...discoveredSubtitles.map((item) => item.url)]));
-  mediaPlaylist = parsed;
-  playlistByUrl = new Map(parsed.segments.map((item) => [normalizedMediaUrl(item.url), item]));
-  playlistByPath = new Map();
-  for (const item of parsed.segments) {
-    const path = new URL(item.url).pathname;
-    playlistByPath.set(path, playlistByPath.has(path) ? null : item);
-  }
-  state.total = parsed.segments.filter((item) => !item.gap).length;
-  state.duration = parsed.duration || state.duration || 0;
-  state.isLive = parsed.isLive;
-  state.wasLive = Boolean(state.wasLive || parsed.isLive);
+  indexMediaPlaylist(parsed);
   state.candidate = { ...candidate };
   await updateMissingTimeline();
   await mirrorJob();
@@ -501,11 +517,111 @@ async function savedSegment(sequence) {
   }
 }
 
-async function saveSegment(segment, observedHeaders = {}) {
+function base64ToArrayBuffer(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes.buffer;
+}
+
+async function ensurePageCaptureHook(tabId, { announce = false } = {}) {
+  if (!(Number(tabId) >= 0)) return false;
+  if (!announce && Date.now() - lastHookInjectionAt < 10000) return false;
+  lastHookInjectionAt = Date.now();
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: Number(tabId), allFrames: true }, world: "MAIN", files: ["page-capture.js"] });
+    if (announce) log("已在网页中开启播放数据直取，播放器收到的分片会被直接保留");
+    return true;
+  } catch (error) {
+    if (announce) log(`网页数据直取暂不可用：${error.message}`);
+    return false;
+  }
+}
+
+async function stopPageCaptureHook(tabId) {
+  if (!(Number(tabId) >= 0)) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: Number(tabId), allFrames: true },
+      world: "MAIN",
+      func: () => { window.__webKeeperCapture?.stop(); }
+    });
+  } catch { /* tab already gone */ }
+}
+
+async function takeBufferedSegment(tabId, url, { waitMs = 0 } = {}) {
+  if (!(Number(tabId) >= 0)) return null;
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    const bytes = await readBufferedSegment(tabId, url);
+    if (bytes) return bytes;
+    if (paused || Date.now() >= deadline) return null;
+    await waitFor(250);
+  }
+}
+
+async function readBufferedSegment(tabId, url) {
+  if (!(Number(tabId) >= 0)) return null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: Number(tabId), allFrames: true },
+      world: "MAIN",
+      args: [url],
+      func: (target) => {
+        const api = window.__webKeeperCapture;
+        if (!api) return { hook: false };
+        const bytes = api.take(target);
+        if (!bytes) return { hook: true };
+        let binary = "";
+        for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+        return { hook: true, data: btoa(binary) };
+      }
+    });
+    const frames = (results || []).map((item) => item?.result).filter(Boolean);
+    const hit = frames.find((item) => item.data);
+    if (hit) return base64ToArrayBuffer(hit.data);
+    if (!frames.some((item) => item.hook)) void ensurePageCaptureHook(tabId);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSegmentInPage(tabId, url, byteRange = "") {
+  if (!(Number(tabId) >= 0)) return null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: Number(tabId) },
+      args: [url, byteRangeHeader(byteRange) || ""],
+      func: async (target, range) => {
+        try {
+          const response = await fetch(target, {
+            credentials: "include",
+            cache: range ? "no-store" : "force-cache",
+            headers: range ? { range } : {}
+          });
+          if (!response.ok || (range && response.status !== 206)) return { ok: false, status: response.status };
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          let binary = "";
+          for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+          return { ok: true, data: btoa(binary) };
+        } catch (error) {
+          return { ok: false, reason: String(error?.message || error) };
+        }
+      }
+    });
+    const result = results?.[0]?.result;
+    if (!result?.ok) return null;
+    return base64ToArrayBuffer(result.data);
+  } catch {
+    return null;
+  }
+}
+
+async function saveSegment(segment, observedHeaders = {}, options = {}) {
   const existing = await savedSegment(segment.sequence);
   if (existing) return existing;
-  const response = await fetchResponse(segment.url, { byteRange: segment.byteRange, headers: observedHeaders });
-  const encrypted = await consumeResponse(response, "arrayBuffer");
+  const encrypted = await fetchMediaBytes(segment.url, { byteRange: segment.byteRange, headers: observedHeaders, ...options });
   if (encrypted.byteLength < 16) throw new Error(t("downloadedItemInvalid", segment.sequence, `下载到的第 ${segment.sequence} 项内容异常。`));
   const decrypted = await decryptIfNeeded(segment, encrypted);
   const fileName = segmentFileName(segment);
@@ -517,6 +633,20 @@ async function saveSegment(segment, observedHeaders = {}) {
   await updateMissingTimeline();
   await mirrorJob();
   return record;
+}
+
+async function savedRecordDirectory(record, cache) {
+  const kind = record.kind || "hls";
+  if (!["dash", "hls-cmaf"].includes(kind)) return segmentDirectory;
+  const key = `${kind}:${record.trackId}`;
+  if (cache.has(key)) return cache.get(key);
+  let directory = null;
+  try {
+    const parent = await workDirectory.getDirectoryHandle(kind === "dash" ? "dash" : "hls-tracks");
+    directory = await parent.getDirectoryHandle(safeName(`${record.contentType}_${record.trackId}`));
+  } catch { directory = null; }
+  cache.set(key, directory);
+  return directory;
 }
 
 async function reconcileSaved() {
@@ -536,11 +666,14 @@ async function reconcileSaved() {
     return;
   }
   const records = await listSegmentRecords(state.id);
+  const directories = new Map();
   let count = 0;
   let bytes = 0;
   for (const record of records) {
     try {
-      const handle = await segmentDirectory.getFileHandle(record.fileName);
+      const directory = await savedRecordDirectory(record, directories);
+      if (!directory) continue;
+      const handle = await directory.getFileHandle(record.fileName);
       const file = await handle.getFile();
       if (file.size > 0) { count += 1; bytes += file.size; }
     } catch { /* ledger entry without file */ }
@@ -847,13 +980,47 @@ async function dashTrackDirectory(dashDirectory, track) {
   return dashDirectory.getDirectoryHandle(safeName(`${track.contentType}_${track.id}`), { create: true });
 }
 
-async function saveDashInitialization(directory, track) {
+async function fetchMediaBytes(url, { byteRange = "", headers = {}, pageTabId = null, cacheMode = "no-store", preferPageBuffer = false } = {}) {
+  if (preferPageBuffer && !byteRange && pageTabId != null) {
+    // A URL that already consumed a full wait was most likely cancelled by the player, so never wait for it twice.
+    const waitMs = pageBufferGaveUp.has(url) ? 0 : pageBufferWaitMs;
+    const buffered = await takeBufferedSegment(pageTabId, url, { waitMs });
+    if (buffered) {
+      pageBufferMisses = 0;
+      pageBufferWaitMs = PAGE_BUFFER_WAIT_PROVEN_MS;
+      pageBufferGaveUp.delete(url);
+      state.fromPageBuffer = Number(state.fromPageBuffer || 0) + 1;
+      if (state.fromPageBuffer === 1) log("正在直接使用播放器已经收到的数据，不再重新请求这些分片");
+      return buffered;
+    }
+    if (waitMs) {
+      pageBufferMisses += 1;
+      pageBufferGaveUp.add(url);
+      if (pageBufferGaveUp.size > 300) pageBufferGaveUp.delete(pageBufferGaveUp.values().next().value);
+      if (!Number(state.fromPageBuffer || 0) && pageBufferMisses >= 3) {
+        pageBufferWaitMs = 0;
+        log("网页数据直取一直没有命中，先改回由任务页重新请求；之后命中会自动恢复等待");
+      }
+    }
+  }
+  try {
+    const response = await fetchResponse(url, { byteRange, headers, cacheMode });
+    return await consumeResponse(response, "arrayBuffer");
+  } catch (error) {
+    if (paused || pageTabId == null) throw error;
+    const fromPage = await fetchSegmentInPage(pageTabId, url, byteRange);
+    if (!fromPage) throw error;
+    log(`任务页请求失败（${error.message}），改由原网页会话取得 ${url}`);
+    return fromPage;
+  }
+}
+
+async function saveDashInitialization(directory, track, options = {}) {
   if (!track.initializationUrl) throw new Error(t("dashInitMissing", null, "这个视频没有提供可用的轨道初始化信息。"));
   const handle = await directory.getFileHandle("init.mp4", { create: true });
   const existing = await handle.getFile();
   if (existing.size > 0 && !track.initializationKey) return existing.size;
-  const response = await fetchResponse(track.initializationUrl, { byteRange: track.initializationByteRange || "" });
-  let bytes = await consumeResponse(response, "arrayBuffer");
+  let bytes = await fetchMediaBytes(track.initializationUrl, { byteRange: track.initializationByteRange || "", ...options });
   if (!bytes.byteLength) throw new Error(t("downloadedItemInvalid", 0, "下载到的媒体初始化内容异常。"));
   if (track.initializationKey) {
     if (!track.initializationKey.iv) throw new Error(t("hlsMapIvRequired"));
@@ -863,7 +1030,7 @@ async function saveDashInitialization(directory, track) {
   return bytes.byteLength;
 }
 
-async function saveDashSegment(directory, track, segment, index) {
+async function saveDashSegment(directory, track, segment, index, options = {}) {
   const recordKind = track.recordKind || "dash";
   const id = recordKind === "dash" ? dashRecordId(track.id, index) : `${state.id}:${recordKind}:${track.id}:${index}`;
   const existingRecord = await dbGet("segments", id);
@@ -874,8 +1041,7 @@ async function saveDashSegment(directory, track, segment, index) {
       if (file.size > 0) return existingRecord;
     } catch { /* retry missing file */ }
   }
-  const response = await fetchResponse(segment.url, { byteRange: segment.byteRange || "" });
-  let bytes = await consumeResponse(response, "arrayBuffer");
+  let bytes = await fetchMediaBytes(segment.url, { byteRange: segment.byteRange || "", ...options });
   if (!bytes.byteLength) throw new Error(t("downloadedItemInvalid", index + 1, `下载到的第 ${index + 1} 项内容异常。`));
   if (segment.key) bytes = await decryptIfNeeded(segment, bytes);
   const fileName = dashPartName(index, segment.url);
@@ -957,6 +1123,7 @@ async function mergeDashOutput(dashDirectory, tracks) {
     await saveSubtitles({ automatic: true });
     state.status = "complete";
     state.validationVersion = 1;
+    if (state.mode === "browser-assisted") await stopPageCaptureHook(candidate.tabId);
     state.message = t("dashComplete", outputName, `视频已保存为 ${outputName}。`);
     await mirrorJob();
     if (cleanupAfterMerge) {
@@ -1076,17 +1243,16 @@ async function refreshCandidateFromStorage() {
   state.candidate = { ...candidate };
 }
 
-function sequenceFromUrl(url) {
-  try {
-    const name = new URL(url).pathname.split("/").pop() || "";
-    const match = name.match(/(?:^|[_-])(\d{1,10})(?:\.[a-z0-9]+)?$/i) || name.match(/(\d{1,10})/);
-    return match ? Number(match[1]) : null;
-  } catch { return null; }
-}
-
 async function refreshCapturePlaylist() {
   try {
-    await loadMediaPlaylist();
+    try {
+      await loadMediaPlaylist();
+    } catch (error) {
+      if (!pinnedPlaylistUrl) throw error;
+      log(`已选清晰度的播放列表暂时不可用（${error.message}），改回浏览器最近发现的列表`);
+      pinnedPlaylistUrl = "";
+      await loadMediaPlaylist();
+    }
     state.status = "capturing";
     state.message = t("assistedWorking", null, "正在跟随网页播放保存内容，不会提前请求后续部分。");
     await mirrorJob();
@@ -1099,12 +1265,285 @@ async function refreshCapturePlaylist() {
   }
 }
 
+async function adoptPlaylistForSegment(segmentUrl) {
+  if (Date.now() - lastAdoptAttemptAt < 15000) return false;
+  lastAdoptAttemptAt = Date.now();
+  const wanted = normalizedMediaUrl(segmentUrl);
+  const queue = Array.from(new Set([...(candidate.playlistUrls || []), ...knownPlaylistSources].filter(Boolean))).filter((item) => item !== mediaPlaylist?.url);
+  const visited = new Set();
+  while (queue.length && visited.size < 24) {
+    const source = queue.shift();
+    if (visited.has(source)) continue;
+    visited.add(source);
+    let parsed;
+    try { parsed = parsePlaylist(await fetchText(source), source); }
+    catch (error) { log(`跳过无法读取的播放列表 ${source}：${error.message}`); continue; }
+    if (parsed.variants.length) {
+      rememberPlaylistSources(parsed);
+      queue.push(...[...parsed.variants.map((item) => item.url), ...(parsed.audios || []).map((item) => item.url)].filter((item) => item && !visited.has(item)));
+      continue;
+    }
+    if (!parsed.segments.some((item) => normalizedMediaUrl(item.url) === wanted)) continue;
+    pinnedPlaylistUrl = source;
+    candidate.playlistUrl = source;
+    indexMediaPlaylist(parsed);
+    state.candidate = { ...candidate };
+    log(`播放器实际使用的清晰度与之前选择的不同，已改用 ${source}`);
+    state.message = t("captureQualityAdopted", null, "已改为按网页播放器实际使用的清晰度保存。");
+    await updateMissingTimeline();
+    await mirrorJob();
+    return true;
+  }
+  return false;
+}
+
+async function locateCaptureSegment(event) {
+  const known = segmentIndex.exact(event.url);
+  if (known) return known;
+  if (Date.now() - lastCaptureRefreshAt >= 8000) {
+    lastCaptureRefreshAt = Date.now();
+    await refreshCapturePlaylist();
+    const refreshed = segmentIndex.exact(event.url);
+    if (refreshed) return refreshed;
+  }
+  if (!capturePlaylistLocked && await adoptPlaylistForSegment(event.url)) {
+    const adopted = segmentIndex.exact(event.url);
+    if (adopted) return adopted;
+  }
+  return segmentIndex.find(event.url);
+}
+
+function deferCaptureSegment(event) {
+  if (pendingCaptureSegments.some((item) => item.url === event.url)) return false;
+  pendingCaptureSegments = [...pendingCaptureSegments, event].slice(-300);
+  return true;
+}
+
+async function replayPendingCaptureSegments() {
+  if (replayingCaptureSegments || !pendingCaptureSegments.length) return;
+  replayingCaptureSegments = true;
+  const queued = pendingCaptureSegments;
+  pendingCaptureSegments = [];
+  try {
+    for (const event of queued) {
+      if (paused || !["capturing", "waiting"].includes(state.status)) { deferCaptureSegment(event); continue; }
+      await captureObservedSegment(event);
+    }
+  } finally {
+    replayingCaptureSegments = false;
+  }
+}
+
+function captureManifestUrl() {
+  return candidate.manifestUrl || (/\.mpd(?:[?#]|$)/i.test(candidate.lastUrl || "") ? candidate.lastUrl : "");
+}
+
+function captureUsesDash() {
+  return Boolean(captureManifestUrl()) && !candidate.playlistUrl && !(candidate.playlistUrls || []).length;
+}
+
+function dashSelectedTracks() {
+  return [...(dashCapture?.selected.values() || [])];
+}
+
+function updateDashCaptureTotals() {
+  const tracks = dashSelectedTracks();
+  state.total = tracks.reduce((sum, track) => sum + track.segments.length, 0);
+  state.selectedTracks = tracks.map((track) => ({ id: track.id, contentType: track.contentType, codecs: track.codecs, bandwidth: track.bandwidth, segmentCount: track.segments.length }));
+}
+
+async function loadDashCaptureManifest() {
+  const manifestUrl = captureManifestUrl();
+  if (!manifestUrl) throw new Error(t("dashManifestMissing", null, "尚未找到完整的 DASH 视频信息，请回到网页播放几秒后重试。"));
+  const manifest = WebKeeperMediaEngine.parseDashManifest(await fetchText(manifestUrl), manifestUrl);
+  if (manifest.drm) throw new Error(t("drmUnsupported", null, "这个视频受 DRM 保护，Web Keeper 不会尝试绕过网站的访问控制。"));
+  const tracks = WebKeeperMediaEngine.mergeDashCaptureTracks(dashCapture?.index.tracks || [], manifest.tracks);
+  const index = WebKeeperMediaEngine.dashCaptureIndex({ tracks });
+  if (!index.tracks.length) throw new Error(t("dashNoTracks", null, "没有找到可直接保存的 DASH 音视频轨道。"));
+  const directory = await workDirectory.getDirectoryHandle("dash", { create: true });
+  const selected = new Map();
+  for (const [contentType, trackId] of Object.entries(state.dashTrackIds || {})) {
+    const track = index.track(trackId);
+    if (track) selected.set(contentType, track);
+  }
+  dashCapture = { manifestUrl, manifest, index, directory, selected, initialized: new Set(), loadedAt: Date.now() };
+  state.duration = manifest.duration || state.duration || 0;
+  updateDashCaptureTotals();
+  log(`已读取 DASH 清单：${index.tracks.length} 条可用轨道`);
+  return dashCapture;
+}
+
+async function refreshDashCaptureManifest() {
+  if (!dashCapture || Date.now() - dashCapture.loadedAt < 8000) return false;
+  try {
+    await loadDashCaptureManifest();
+    return true;
+  } catch (error) {
+    log(`DASH 清单暂时无法更新：${error.message}`);
+    return false;
+  }
+}
+
+async function lockDashTrack(track) {
+  const current = dashCapture.selected.get(track.contentType);
+  if (current) return current.id === track.id ? current : null;
+  dashCapture.selected.set(track.contentType, track);
+  state.dashTrackIds = { ...(state.dashTrackIds || {}), [track.contentType]: track.id };
+  if (track.contentType === "video" && track.height) state.resolution = `${track.height}p`;
+  updateDashCaptureTotals();
+  log(`播放器正在使用${track.contentType === "video" ? "视频" : "音频"}轨道 ${track.id}，本任务固定保存这一条`);
+  await mirrorJob();
+  return track;
+}
+
+async function updateDashMissingTimeline() {
+  const video = dashCapture?.selected.get("video");
+  if (!video) return [];
+  const records = (await listSegmentRecords(state.id)).filter((item) => item.kind === "dash" && item.trackId === video.id);
+  const saved = new Set(records.map((item) => Number(item.index)));
+  state.missingRanges = WebKeeperMediaEngine.missingTimeline(video.segments.map((segment, index) => ({ ...segment, sequence: index })), saved);
+  state.missing = state.missingRanges.reduce((sum, range) => sum + range.count, 0);
+  return state.missingRanges;
+}
+
+async function captureObservedDashSegment(event) {
+  let located = dashCapture.index.find(event.url);
+  if (!located && await refreshDashCaptureManifest()) located = dashCapture.index.find(event.url);
+  if (!located) {
+    if (deferCaptureSegment(event)) log(`暂无法在 DASH 清单中定位：${event.url}`);
+    return;
+  }
+  const track = dashCapture.index.track(located.trackId);
+  if (!track) return;
+  const selected = await lockDashTrack(track);
+  if (!selected) {
+    if (Date.now() - qualitySwitchReportedAt > 60000) {
+      qualitySwitchReportedAt = Date.now();
+      state.message = t("captureQualityChanged", null, "网页播放器换了清晰度，本任务只保存最初的清晰度。请在网页上固定清晰度，避免出现缺口。");
+      await mirrorJob();
+    }
+    return;
+  }
+  const directory = await dashTrackDirectory(dashCapture.directory, track);
+  const options = { pageTabId: event.tabId ?? candidate.tabId, cacheMode: "force-cache", preferPageBuffer: true };
+  try {
+    if (located.kind === "initialization") {
+      await saveDashInitialization(directory, track, options);
+      dashCapture.initialized.add(track.id);
+      return;
+    }
+    if (!dashCapture.initialized.has(track.id)) {
+      try {
+        await saveDashInitialization(directory, track, options);
+        dashCapture.initialized.add(track.id);
+      } catch (error) { log(`轨道初始化内容稍后重试：${error.message}`); }
+    }
+    const recorded = await dbGet("segments", dashRecordId(track.id, located.index));
+    if (recorded) {
+      try {
+        const file = await (await directory.getFileHandle(recorded.fileName)).getFile();
+        if (file.size > 0) return;
+      } catch { /* ledger entry without file, save it again */ }
+    }
+    log(`播放器已请求 ${track.contentType} 第 ${located.index + 1} 项，开始保存`);
+    await saveDashSegment(directory, track, track.segments[located.index], located.index, options);
+    const isLive = dashCapture.manifest.type === "dynamic";
+    state.status = "capturing";
+    state.message = isLive
+      ? t("captureLiveWaiting", null, "直播内容会持续保存；想结束时点“检查并生成视频”。")
+      : t("assistedSaving", null, "正在跟随网页播放保存；已经完成的内容会保留，可随时暂停。");
+    await updateDashMissingTimeline();
+    await mirrorJob();
+    await replayPendingCaptureSegments();
+    if (!isLive && state.total && state.done >= state.total && autoFinalize) await finalizeDashCapture();
+  } catch (error) {
+    state.failed = Number(state.failed || 0) + 1;
+    state.message = t("assistedItemFailed", error.message, `有一部分暂时未能保存：${error.message}。再次播放到这里时会重试。`);
+    log(state.message);
+    await mirrorJob();
+  }
+}
+
+async function finalizeDashCapture() {
+  const tracks = dashSelectedTracks();
+  if (!tracks.length) throw new Error(t("dashNoTracks", null, "没有找到可直接保存的 DASH 音视频轨道。"));
+  const missing = Math.max(0, Number(state.total || 0) - Number(state.done || 0));
+  if (missing && !confirm(t("createPartialConfirm", missing, `仍有 ${missing} 项待补。要先按现有内容生成一个不完整视频吗？`))) return;
+  paused = false;
+  try {
+    for (const track of tracks) {
+      const directory = await dashTrackDirectory(dashCapture.directory, track);
+      await saveDashInitialization(directory, track, { pageTabId: candidate.tabId, cacheMode: "force-cache", preferPageBuffer: true });
+    }
+    await mergeDashOutput(dashCapture.directory, tracks);
+  } catch (error) {
+    state.status = "error";
+    state.message = t("outputFailed", error.message, `生成视频失败：${error.message}`);
+    log(state.message);
+    await mirrorJob();
+  }
+}
+
+async function switchCaptureToDash(event) {
+  if (dashCapture || Number(state.done || 0) > 0 || !captureManifestUrl()) return false;
+  if (Date.now() - lastDashSwitchAt < 15000) return false;
+  lastDashSwitchAt = Date.now();
+  try { await loadDashCaptureManifest(); }
+  catch (error) { log(`暂时无法按 DASH 处理：${error.message}`); return false; }
+  if (!dashCapture.index.find(event.url)) {
+    dashCapture = null;
+    return false;
+  }
+  state.providerId = "dash";
+  log("这个视频使用 DASH，网页辅助保存已切换到 DASH 轨道模式");
+  await mirrorJob();
+  return true;
+}
+
+async function runDashCapture() {
+  paused = false;
+  state.providerId = "dash";
+  state.progressUnit = "items";
+  await ensureDirectories();
+  await ensurePageCaptureHook(candidate.tabId, { announce: true });
+  state.status = "waiting";
+  state.message = t("assistedPreparing", null, "正在准备网页辅助保存。");
+  await mirrorJob();
+  const queued = await queuedCaptureEvents();
+  try {
+    await loadDashCaptureManifest();
+    await reconcileDashSaved(dashCapture.directory, dashSelectedTracks());
+    await updateDashMissingTimeline();
+    state.status = "capturing";
+    state.message = t("assistedWorking", null, "正在跟随网页播放保存内容，不会提前请求后续部分。");
+  } catch (error) {
+    state.status = "waiting";
+    state.message = t("assistedWaiting", error.message, `${error.message} 请回到视频页面继续播放，Web Keeper 会等待新的内容。`);
+    log(`等待 DASH 清单：${error.message}`);
+  }
+  await mirrorJob();
+  if (state.status === "capturing") await replayQueuedCaptureEvents(queued);
+}
+
+async function adoptQueuedManifests() {
+  const manifests = (await queuedCaptureEvents()).filter((event) => event.kind === "manifest").map((event) => event.url);
+  if (!manifests.length) return;
+  candidate.manifestUrls = Array.from(new Set([...(candidate.manifestUrls || []), ...manifests]));
+  candidate.manifestUrl ||= manifests[manifests.length - 1];
+}
+
 async function runCapture() {
+  await adoptQueuedManifests();
+  if (captureUsesDash()) return runDashCapture();
+  dashCapture = null;
   paused = false;
   state.providerId = "browser-assisted";
   state.progressUnit = "items";
   await ensureDirectories();
+  await ensurePageCaptureHook(candidate.tabId, { announce: true });
   await reconcileSaved();
+  capturePlaylistLocked = Number(state.done || 0) > 0;
+  qualitySwitchReportedAt = 0;
   state.status = "waiting";
   state.message = t("assistedPreparing", null, "正在准备网页辅助保存。");
   await mirrorJob();
@@ -1129,39 +1568,57 @@ async function replayQueuedCaptureEvents(events = []) {
     if (paused || !["capturing", "waiting"].includes(state.status)) break;
     await captureObservedSegment(event);
   }
+  if (pendingCaptureSegments.length) log(`其中 ${pendingCaptureSegments.length} 个请求暂时无法对应到播放列表，会在播放列表更新后重试`);
 }
 
 function matchesCandidate(event) {
-  if (event?.candidateId && candidate?.id) return event.candidateId === candidate.id;
-  return state && event && Number(event.tabId) === Number(candidate.tabId) && event.product === candidate.product && (candidate.resolution === "auto" || event.resolution === candidate.resolution || event.resolution === "auto");
+  if (!state || !event || !candidate) return false;
+  if (event.candidateId && candidate.id && event.candidateId === candidate.id) return true;
+  return Number(event.tabId) === Number(candidate.tabId) && event.product === candidate.product && (candidate.resolution === "auto" || event.resolution === candidate.resolution || event.resolution === "auto");
 }
 
 async function captureObservedSegment(event) {
   if (paused || !["capturing", "waiting"].includes(state.status)) return;
+  if (event.kind === "manifest") {
+    if (dashCapture && await refreshDashCaptureManifest()) await replayPendingCaptureSegments();
+    return;
+  }
   if (event.kind === "playlist") {
-    candidate.playlistUrl = event.url;
+    if (!pinnedPlaylistUrl) candidate.playlistUrl = event.url;
+    if (Date.now() - lastCaptureRefreshAt < 4000) return;
+    lastCaptureRefreshAt = Date.now();
     await refreshCapturePlaylist();
+    await replayPendingCaptureSegments();
     return;
   }
   if (event.kind !== "segment") return;
+  if (dashCapture) return captureObservedDashSegment(event);
   if (!segmentDirectory) return;
-  let sequence = sequenceFromUrl(event.url);
-  let meta = playlistByUrl.get(normalizedMediaUrl(event.url)) || playlistByPath.get(new URL(event.url).pathname);
-  if (!meta && sequence != null && mediaPlaylist) meta = mediaPlaylist.segments.find((item) => item.sequence === sequence);
+  const meta = await locateCaptureSegment(event);
   if (!meta) {
-    log(`暂无法定位分片：${event.url}`);
+    if (await switchCaptureToDash(event)) return captureObservedDashSegment(event);
+    if (deferCaptureSegment(event)) log(`暂无法定位分片，已记下稍后重试：${event.url}`);
+    if (capturePlaylistLocked && !segmentIndex.sameLocation(event.url) && Date.now() - qualitySwitchReportedAt > 60000) {
+      qualitySwitchReportedAt = Date.now();
+      state.message = t("captureQualityChanged", null, "网页播放器换了清晰度，本任务只保存最初的清晰度。请在网页上固定清晰度，避免出现缺口。");
+      await mirrorJob();
+    }
     return;
   }
-  sequence = meta.sequence;
+  const sequence = meta.sequence;
   try {
     const existing = await savedSegment(sequence);
     if (existing) return;
     log(`播放器已请求分片 ${sequence}，开始保存`);
-    await saveSegment({ ...meta, url: event.url }, event.headers || {});
+    await saveSegment({ ...meta, url: event.url }, event.headers || {}, { pageTabId: event.tabId ?? candidate.tabId, cacheMode: "force-cache", preferPageBuffer: true });
+    capturePlaylistLocked = true;
     state.status = "capturing";
-    state.message = t("assistedSaving", null, "正在跟随网页播放保存；已经完成的内容会保留，可随时暂停。");
+    state.message = state.isLive
+      ? t("captureLiveWaiting", null, "直播内容会持续保存；想结束时点“检查并生成视频”。")
+      : t("assistedSaving", null, "正在跟随网页播放保存；已经完成的内容会保留，可随时暂停。");
     await mirrorJob();
-    if (state.total && state.done >= state.total && autoFinalize) await mergeOutput(false);
+    await replayPendingCaptureSegments();
+    if (!state.isLive && state.total && state.done >= state.total && autoFinalize) await mergeOutput(false);
   } catch (error) {
     state.failed = Number(state.failed || 0) + 1;
     state.message = t("assistedItemFailed", error.message, `有一部分暂时未能保存：${error.message}。再次播放到这里时会重试。`);
@@ -1174,7 +1631,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type !== "media-observed" || !matchesCandidate(message.event)) return;
   const event = message.event;
   candidate.headers = { ...(candidate.headers || {}), ...(event.headers || {}) };
-  if (event.kind === "playlist") candidate.playlistUrl = event.url;
+  if (event.kind === "playlist" && !pinnedPlaylistUrl) candidate.playlistUrl = event.url;
   if (event.kind === "manifest") candidate.manifestUrl = event.url;
   if (event.kind === "direct") candidate.directUrl = event.url;
   if (event.kind === "segment") candidate.segmentUrl = event.url;
@@ -1290,6 +1747,7 @@ async function mergeOutput(allowPartial = true) {
     state.status = "complete";
     state.validationVersion = 1;
     state.missing = missing.length;
+    if (state.mode === "browser-assisted") await stopPageCaptureHook(candidate.tabId);
     state.message = missing.length ? t("outputPartial", [outputName, missing.length], `已生成 ${outputName}，但仍有 ${missing.length} 处缺口。`) : t("outputComplete", outputName, `已生成 ${outputName}。确认播放正常后，可以清理临时下载文件。`);
     log(state.message);
     await mirrorJob();
@@ -1477,7 +1935,8 @@ async function removeTemporaryData() {
 }
 
 async function finalizeDownloadedTask() {
-  if (state.providerId === "hls" && !state.separateTracks) return mergeOutput(true);
+  if (dashCapture) return finalizeDashCapture();
+  if (state.mode === "browser-assisted" || (state.providerId === "hls" && !state.separateTracks)) return mergeOutput(true);
   const previous = autoFinalize;
   autoFinalize = true;
   try { await runDirect(); }
@@ -1527,6 +1986,7 @@ async function deleteOutput() {
 
 async function removeTask(jobId = state?.id) {
   if (!jobId || !confirm(t("removeTaskConfirm", null, "从下载中心移除这条任务记录？已经保存的文件和断点内容都会保留。"))) return;
+  if (state?.id === jobId && state.mode === "browser-assisted") await stopPageCaptureHook(candidate?.tabId);
   await dbDelete("states", jobId);
   await dbDelete("handles", jobId);
   const stored = await chrome.storage.local.get({ [JOBS_KEY]: [] });
