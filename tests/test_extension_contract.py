@@ -22,7 +22,7 @@ class ExtensionContractTests(unittest.TestCase):
         self.assertEqual("zh_CN", manifest["default_locale"])
         self.assertEqual("split", manifest["incognito"])
         self.assertEqual("__MSG_appName__", manifest["name"])
-        self.assertEqual("0.3.6", manifest["version"])
+        self.assertEqual("0.3.7", manifest["version"])
 
     def test_popup_does_not_load_native_helper(self) -> None:
         html = (ROOT / "extension" / "popup.html").read_text(encoding="utf-8")
@@ -116,6 +116,70 @@ require('./extension/background.js');
         self.assertTrue(result["created"]["active"])
         self.assertEqual(23, result["created"]["windowId"])
 
+    def test_background_queues_extensionless_hls_segments(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is not available")
+        source = r"""
+let headersReceived;
+const now = Date.now();
+const state = {
+  wkCandidates: [{
+    id: '7:watch.example-video:auto', tabId: 7, product: 'watch.example-video', resolution: 'auto',
+    playlistUrl: 'https://cdn.example/master.m3u8', playlistUrls: ['https://cdn.example/master.m3u8'],
+    headers: {}, subtitles: [], directFiles: [], lastSeen: now, decision: 'browser-assisted'
+  }],
+  wkMediaEvents: [], discover: true
+};
+global.chrome = {
+  runtime: {
+    id: 'test-extension', lastError: null,
+    onInstalled: { addListener() {} }, onMessage: { addListener() {} },
+    sendMessage(message, callback) { if (callback) callback(); },
+    getURL: (path) => `chrome-extension://test-extension/${path}`
+  },
+  storage: { local: {
+    async get(defaults) { return { ...defaults, ...state }; },
+    async set(values) { Object.assign(state, values); }
+  } },
+  tabs: { async get() { return { url: 'https://watch.example/video', title: 'Example video' }; }, async create() {} },
+  action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
+  i18n: { getMessage: () => '' },
+  webRequest: {
+    onBeforeSendHeaders: { addListener() {} },
+    onHeadersReceived: { addListener(fn) { headersReceived = fn; } }
+  }
+};
+require('./extension/background.js');
+headersReceived({
+  requestId: 'segment-1', tabId: 7, type: 'xmlhttprequest',
+  url: 'https://cdn.example/chunk?id=42', initiator: 'https://watch.example', timeStamp: now + 1,
+  responseHeaders: [
+    { name: 'content-type', value: 'video/mp4' },
+    { name: 'content-length', value: '1048576' }
+  ]
+});
+headersReceived({
+  requestId: 'direct-1', tabId: 8, type: 'media',
+  url: 'https://files.example/file?id=complete', initiator: 'https://watch.example', timeStamp: now + 2,
+  responseHeaders: [
+    { name: 'content-type', value: 'video/mp4' },
+    { name: 'content-length', value: '83886080' }
+  ]
+});
+setTimeout(() => {
+  const event = state.wkMediaEvents.find((item) => item.url.includes('chunk?id=42'));
+  const direct = state.wkCandidates.find((item) => item.tabId === 8);
+  console.log(JSON.stringify({ kind: event?.kind, candidateId: event?.candidateId, count: state.wkMediaEvents.length, directUrl: direct?.directUrl }));
+}, 80);
+"""
+        completed = subprocess.run([node, "-e", source], cwd=ROOT, check=True, capture_output=True, text=True, encoding="utf-8")
+        result = json.loads(completed.stdout)
+        self.assertEqual("segment", result["kind"])
+        self.assertEqual("7:watch.example-video:auto", result["candidateId"])
+        self.assertEqual(1, result["count"])
+        self.assertEqual("https://files.example/file?id=complete", result["directUrl"])
+
     def test_download_page_has_resume_encryption_and_safe_delete_contracts(self) -> None:
         html = (ROOT / "extension" / "download.html").read_text(encoding="utf-8")
         script = (ROOT / "extension" / "download.js").read_text(encoding="utf-8")
@@ -161,6 +225,9 @@ require('./extension/background.js');
         self.assertIn("preferredOutputBaseName", download)
         self.assertIn('id="speed"', html)
         self.assertIn("patchMp4InitDuration", download)
+        self.assertIn('const MEDIA_EVENTS_KEY = "wkMediaEvents"', background)
+        self.assertIn("replayQueuedCaptureEvents", download)
+        self.assertIn("playlistByUrl", download)
         self.assertIn("playlistUrls", background)
         self.assertIn("directFiles", background)
 

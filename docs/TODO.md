@@ -43,7 +43,10 @@
   - [x] IndexedDB 记录任务、目录授权和分片断点；File System Access 直写用户目录  
   - [x] 普通 AES-128 HLS 解密、TS/常见 fMP4 连接和任务内安全删除入口  
   - [x] 浏览器辅助模式跟随实际请求，移除 Helper 前置与 burst-ahead  
-  - [x] 任务页意外关闭后恢复为明确的暂停状态；直接写授权目录，不额外复制大文件到 OPFS  
+  - [x] 任务页意外关闭后恢复为明确的暂停状态；background 暂存近期请求元数据供重开补处理  
+  - [x] 无扩展名 HLS playlist/segment 按 Content-Type 和近期 HLS 上下文识别  
+  - [ ] Capture 迁入可持续运行的扩展执行上下文；当前任务页关闭时不保存响应体，只能稍后重请求  
+  - [ ] DASH、复杂独立音轨和直播滚动 playlist 的 Capture 适配  
   - 浏览器内完成常见 HLS remux/mux，复杂转码不作为 MVP 前置条件  
   - 在真实目标站点记录 401/403/404/429、响应大小、Token 变化和播放器状态，区分 API 边界与抓取策略问题  
   - 未安装 Helper 也能完成核心流程
@@ -141,7 +144,8 @@
 
 ## 改动时顺手记（非独立需求，但常踩坑）
 
-- [ ] Capture 的 `burst-ahead` / 多标签并发策略可配置，避免失败风暴  
+- [x] Capture 移除 `burst-ahead`，按任务单队列跟随播放器实际请求  
+- [ ] Capture 严格会话站点适配：一次性 URL、Referer/Origin、连接绑定与播放器私有 token  
 - [ ] `state` 持久化勿再做成频繁全量巨型 JSON（可考虑 sqlite / 分文件）  
 - [ ] `/api/status` 保持轻量；全量扫盘仅手动或低频缓存  
 - [ ] Merge 与 Direct download 的产品文案/引导做清楚  

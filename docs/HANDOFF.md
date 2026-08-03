@@ -1,5 +1,15 @@
 # Web Keeper 交接文档（Handoff）
 
+## 0.3.7 Capture 可靠性补强与真实边界（2026-08-04）
+
+- 当前 Capture 的准确定位是“普通单轨 VOD HLS 可试用的纯扩展 MVP”，不是适用于任意媒体协议的通用响应截获器。直接文件和 DASH 仍应优先使用直接下载；DASH Capture、复杂独立音轨、直播滚动窗口、严格一次性 URL 尚未完成。
+- background 现在把最近 30 分钟、最多 600 条 playlist/segment 请求元数据保存在 `wkMediaEvents`。Capture 任务页重新打开时会恢复这些 URL、headers 和时间信息，并跳过账本中已经保存的分片，减少任务页短暂关闭造成的遗漏。
+- 队列只保存请求元数据，不保存浏览器已经收到的响应体。Capture 仍是在看到播放器请求后由任务页重新请求一次；一次性 URL、强 Referer/Origin、连接绑定或播放器私有会话仍可能失败。因此任务页保持开启仍是最可靠的使用方式。
+- response Content-Type 现在可以识别没有 `.m3u8` 后缀的 HLS playlist，以及近期 HLS 页面中的无扩展名 MP2T/ISO segment/AAC 和常见 XHR fMP4/octet-stream 分片。完整媒体仍保留独立 direct-file 候选。
+- playlist 分片映射先按完整 URL（含 query）精确匹配，只有 URL 不一致时才退回无歧义 pathname/sequence，避免多个 `/chunk?id=...` 被错误映射成同一分片。
+- Capture 继续采用单队列、无 burst-ahead；暂停会中止活动请求，缺片可由用户确认的智能 seek 补全，完整后复用视频轨校验、MP4 时长修正和浏览器 Downloads/自定义目录交付。
+- 新增无扩展名 HLS 分片入队行为测试；当前自动化测试 32 项通过。真实 Edge 播放 → 关闭任务页 → 继续播放 → 重开恢复仍需用户目标站点验收。
+
 ## 0.3.6 成品元数据、命名与速度（2026-08-03）
 
 - 修复 mux.js 初始化段把 `mvhd/tkhd/mdhd` 时长留成 `0xFFFFFFFF` 的问题。部分 Windows 属性页会把这个“未知时长”按 90 kHz 时间基显示成 `13:15:21`，即使播放器能按分片时间戳正确显示约一小时。现在 TS 转 MP4、HLS fMP4 和 DASH/CMAF 都使用 playlist/manifest 的实际时长回填初始化元数据。
@@ -52,11 +62,11 @@
 - background 将检测到的视频、清晰度、播放列表、最近 headers 和字幕保存在扩展本地存储；popup 离线也能显示候选并由用户选择。
 - 新增独立下载任务页：用户主动选择保存目录后才写盘；直接下载按分片保存并断点跳过已有文件。
 - 针对当前站点样本实现普通 AES-128 HLS 浏览器内解密，MPEG-TS 完成后连接为可播放 `.ts`；分片式 MP4 支持 init segment + media fragment 连接。
-- 浏览器辅助抓取默认只跟随播放器实际请求，单队列处理，不再进行 burst-ahead；任务页必须保持开启。
+- 浏览器辅助抓取默认只跟随播放器实际请求，单队列处理，不再进行 burst-ahead。任务页保持开启最可靠；0.3.7 起短暂关闭期间会暂存请求元数据并在重开后尝试重新获取，但不会缓存浏览器响应体。
 - 任务页提供继续、暂停、保存字幕、检查并生成视频，以及“只删除本任务分片”的入口；不扫描或修改现有 `data/captures`。
 - `scripts/start_edge.ps1` 现在直接打开扩展任务页，不再把本地 Dashboard 当启动前置条件。
 
-当前限制：尚未加入 libav/WASM 复杂 remux/转码；DRM、特殊鉴权、非 CMAF/直播型 HLS 独立音轨和部分非标准清单可能失败。纯扩展真实站点验证优先于继续 Helper。
+当前限制：Capture 主要覆盖普通 HLS，并非 DASH/任意响应的通用抓取器；它会重新请求播放器观察到的分片，而不是读取浏览器缓存。DRM、一次性 URL、特殊鉴权、非 CMAF/直播型 HLS 独立音轨和部分非标准清单可能失败。纯扩展真实站点验证优先于继续 Helper。
 
 ### 产品化要求补充（2026-08-03）
 

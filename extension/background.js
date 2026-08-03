@@ -1,10 +1,14 @@
-const SCRIPT_VERSION = "web-keeper-extension-0.3.6";
+const SCRIPT_VERSION = "web-keeper-extension-0.3.7";
 const CANDIDATES_KEY = "wkCandidates";
 const JOBS_KEY = "wkJobs";
+const MEDIA_EVENTS_KEY = "wkMediaEvents";
 const MAX_CANDIDATES = 120;
 const MAX_PENDING_REQUESTS = 500;
+const MAX_MEDIA_EVENTS = 600;
+const MEDIA_EVENT_TTL_MS = 30 * 60 * 1000;
 let candidateWriteChain = Promise.resolve();
 const pendingMediaHeaders = new Map();
+const recentHlsTabs = new Map();
 
 function mediaKind(url, requestType = "") {
   try {
@@ -128,10 +132,25 @@ function broadcastMedia(event) {
   chrome.runtime.sendMessage({ type: "media-observed", event }, () => void chrome.runtime.lastError);
 }
 
+function queuedMediaEvents(events, observed, candidateId) {
+  const now = Date.now();
+  const recent = (Array.isArray(events) ? events : []).filter((item) => Number(item.timeStamp || 0) >= now - MEDIA_EVENT_TTL_MS);
+  if (!["playlist", "segment"].includes(observed.kind)) return recent.slice(-MAX_MEDIA_EVENTS);
+  const queued = {
+    ...observed,
+    id: `${observed.tabId}:${observed.kind}:${observed.timeStamp}:${observed.url}`,
+    candidateId
+  };
+  const withoutDuplicate = recent.filter((item) => item.id !== queued.id && !(item.kind === queued.kind && item.tabId === queued.tabId && item.url === queued.url && Math.abs(Number(item.timeStamp || 0) - Number(queued.timeStamp || 0)) < 1000));
+  withoutDuplicate.push(queued);
+  return withoutDuplicate.slice(-MAX_MEDIA_EVENTS);
+}
+
 async function recordCandidate(details, forcedKind = "") {
   if (String(details.initiator || "").startsWith(`chrome-extension://${chrome.runtime.id}`)) return;
   const kind = forcedKind || mediaKind(details.url, details.type);
   if (!kind) return;
+  if (kind === "playlist" && details.tabId >= 0) recentHlsTabs.set(details.tabId, Date.now());
   const { discover = false } = await chrome.storage.local.get({ discover: false });
   if (!discover) return;
   const context = await tabContext(details.tabId);
@@ -155,7 +174,7 @@ async function recordCandidate(details, forcedKind = "") {
   };
 
   candidateWriteChain = candidateWriteChain.then(async () => {
-    const stored = await chrome.storage.local.get({ [CANDIDATES_KEY]: [] });
+    const stored = await chrome.storage.local.get({ [CANDIDATES_KEY]: [], [MEDIA_EVENTS_KEY]: [] });
     const candidates = Array.isArray(stored[CANDIDATES_KEY]) ? stored[CANDIDATES_KEY] : [];
 
     if (kind === "subtitle") {
@@ -241,7 +260,8 @@ async function recordCandidate(details, forcedKind = "") {
     candidate.mediaKind = kind;
 
     candidates.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0));
-    await chrome.storage.local.set({ [CANDIDATES_KEY]: candidates.slice(0, MAX_CANDIDATES) });
+    const mediaEvents = queuedMediaEvents(stored[MEDIA_EVENTS_KEY], observed, candidate.id);
+    await chrome.storage.local.set({ [CANDIDATES_KEY]: candidates.slice(0, MAX_CANDIDATES), [MEDIA_EVENTS_KEY]: mediaEvents });
     if (isNew) {
       await chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
       await chrome.action.setBadgeText({ text: "!" });
@@ -288,29 +308,44 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    const contentType = (details.responseHeaders || []).find((item) => String(item.name).toLowerCase() === "content-type")?.value || "";
-    const contentDisposition = (details.responseHeaders || []).find((item) => String(item.name).toLowerCase() === "content-disposition")?.value || "";
-    const explicitMedia = /^(video|audio)\//i.test(contentType) && !/mpegurl|dash\+xml/i.test(contentType);
-    const mediaAttachment = /filename\*?\s*=.*\.(?:mp4|webm|mkv|mov|m4v|mp3|m4a|flac|ogg|wav)(?:["';\s]|$)/i.test(contentDisposition);
-    const obviousSegment = /\.(?:ts|m4s|cmfv|cmfa|aac)(?:[?#]|$)/i.test(details.url);
-    const headers = responseHeaderObject(details);
-    const size = responseSize(headers);
-    const browserMedia = details.type === "media" && (!size || size >= 500000);
-    const explicitSubtitle = /^(?:text\/vtt|application\/(?:ttml\+xml|x-subrip)|text\/srt)/i.test(contentType);
-    if (explicitSubtitle) {
-      const pending = pendingMediaHeaders.get(details.requestId) || {};
-      pendingMediaHeaders.delete(details.requestId);
-      void recordCandidate({ ...details, ...pending }, "subtitle");
-      return;
-    }
-    if (!["media", "xmlhttprequest", "other"].includes(details.type) || (!explicitMedia && !mediaAttachment && !browserMedia) || obviousSegment) return;
-    const pending = pendingMediaHeaders.get(details.requestId) || {};
-    pendingMediaHeaders.delete(details.requestId);
-    void recordCandidate({ ...details, ...pending }, "direct");
+    void recordResponseCandidate(details);
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders", "extraHeaders"]
 );
+
+async function recordResponseCandidate(details) {
+  const contentType = ((details.responseHeaders || []).find((item) => String(item.name).toLowerCase() === "content-type")?.value || "").toLowerCase();
+  const contentDisposition = (details.responseHeaders || []).find((item) => String(item.name).toLowerCase() === "content-disposition")?.value || "";
+  const pending = pendingMediaHeaders.get(details.requestId) || {};
+  pendingMediaHeaders.delete(details.requestId);
+  const enriched = { ...details, ...pending };
+  if (/mpegurl/i.test(contentType)) return recordCandidate(enriched, "playlist");
+  if (/dash\+xml/i.test(contentType)) return recordCandidate(enriched, "manifest");
+  if (/^(?:text\/vtt|application\/(?:ttml\+xml|x-subrip)|text\/srt)/i.test(contentType)) return recordCandidate(enriched, "subtitle");
+  if (!["media", "xmlhttprequest", "other"].includes(details.type)) return;
+
+  const obviousSegment = /\.(?:ts|m4s|cmfv|cmfa|aac)(?:[?#]|$)/i.test(details.url);
+  if (obviousSegment) return;
+  const stored = await chrome.storage.local.get({ [CANDIDATES_KEY]: [] });
+  const now = Date.now();
+  const hasRecentHls = Number(recentHlsTabs.get(details.tabId) || 0) >= now - 10 * 60 * 1000 || (stored[CANDIDATES_KEY] || []).some((item) => Number(item.tabId) === Number(details.tabId)
+    && Number(item.lastSeen || 0) >= now - 10 * 60 * 1000
+    && Boolean(item.playlistUrl || (item.playlistUrls || []).length));
+  const hasMediaExtension = /\.(?:mp4|webm|mkv|mov|m4v|mp3|m4a|flac|ogg|wav)(?:[?#]|$)/i.test(details.url);
+  const strongSegmentMime = /(?:video\/(?:mp2t|iso\.segment)|audio\/aac)/i.test(contentType);
+  const segmentMime = strongSegmentMime || /(?:video\/mp4|audio\/mp4|application\/(?:octet-stream|mp4))/i.test(contentType);
+  const headers = responseHeaderObject(details);
+  const size = responseSize(headers);
+  const likelyExtensionlessSegment = hasRecentHls && !hasMediaExtension && segmentMime
+    && (details.type !== "media" || strongSegmentMime) && (!size || (size >= 16 && size <= 64 * 1024 * 1024));
+  if (likelyExtensionlessSegment) return recordCandidate(enriched, "segment");
+
+  const explicitMedia = /^(video|audio)\//i.test(contentType) && !/mpegurl|dash\+xml/i.test(contentType);
+  const mediaAttachment = /filename\*?\s*=.*\.(?:mp4|webm|mkv|mov|m4v|mp3|m4a|flac|ogg|wav)(?:["';\s]|$)/i.test(contentDisposition);
+  const browserMedia = details.type === "media" && (!size || size >= 500000);
+  if (explicitMedia || mediaAttachment || browserMedia) return recordCandidate(enriched, "direct");
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "open-extension-page") {

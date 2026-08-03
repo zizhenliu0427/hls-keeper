@@ -1,5 +1,6 @@
 const CANDIDATES_KEY = "wkCandidates";
 const JOBS_KEY = "wkJobs";
+const MEDIA_EVENTS_KEY = "wkMediaEvents";
 const DB_NAME = "web-keeper-downloads";
 const DB_VERSION = 1;
 const query = new URLSearchParams(location.search);
@@ -19,6 +20,7 @@ let captureQueue = Promise.resolve();
 let mediaPlaylist = null;
 let hlsAudioPlaylist = null;
 let playlistByPath = new Map();
+let playlistByUrl = new Map();
 let logs = [];
 let showDiagnostics = false;
 const responseControllers = new WeakMap();
@@ -170,6 +172,14 @@ function validSubtitleUrls(urls = []) {
     try { return /\.(?:vtt|srt|ttml|dfxp|ass|ssa)(?:[?#]|$)/i.test(new URL(url).href); }
     catch { return false; }
   })));
+}
+
+function normalizedMediaUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    return url.href;
+  } catch { return String(value || ""); }
 }
 
 function escapeHtml(value) {
@@ -406,7 +416,12 @@ async function loadMediaPlaylist() {
   discoveredSubtitles = [...discoveredSubtitles, ...(parsed.subtitles || [])];
   candidate.subtitles = Array.from(new Set([...(candidate.subtitles || []), ...discoveredSubtitles.map((item) => item.url)]));
   mediaPlaylist = parsed;
-  playlistByPath = new Map(parsed.segments.map((item) => [new URL(item.url).pathname, item]));
+  playlistByUrl = new Map(parsed.segments.map((item) => [normalizedMediaUrl(item.url), item]));
+  playlistByPath = new Map();
+  for (const item of parsed.segments) {
+    const path = new URL(item.url).pathname;
+    playlistByPath.set(path, playlistByPath.has(path) ? null : item);
+  }
   state.total = parsed.segments.filter((item) => !item.gap).length;
   state.duration = parsed.duration || state.duration || 0;
   state.isLive = parsed.isLive;
@@ -1093,10 +1108,31 @@ async function runCapture() {
   state.status = "waiting";
   state.message = t("assistedPreparing", null, "正在准备网页辅助保存。");
   await mirrorJob();
+  const queued = await queuedCaptureEvents();
+  const queuedPlaylists = queued.filter((event) => event.kind === "playlist").map((event) => event.url);
+  candidate.playlistUrls = Array.from(new Set([...(candidate.playlistUrls || []), ...queuedPlaylists]));
   await refreshCapturePlaylist();
+  if (state.status === "capturing") await replayQueuedCaptureEvents(queued);
+}
+
+async function queuedCaptureEvents() {
+  const stored = await chrome.storage.local.get({ [MEDIA_EVENTS_KEY]: [] });
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  return (stored[MEDIA_EVENTS_KEY] || []).filter((event) => Number(event.timeStamp || 0) >= cutoff && matchesCandidate(event)).sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
+}
+
+async function replayQueuedCaptureEvents(events = []) {
+  const segments = events.filter((event) => event.kind === "segment");
+  if (!segments.length) return;
+  log(`恢复处理任务页关闭期间记录的 ${segments.length} 个媒体请求`);
+  for (const event of segments) {
+    if (paused || !["capturing", "waiting"].includes(state.status)) break;
+    await captureObservedSegment(event);
+  }
 }
 
 function matchesCandidate(event) {
+  if (event?.candidateId && candidate?.id) return event.candidateId === candidate.id;
   return state && event && Number(event.tabId) === Number(candidate.tabId) && event.product === candidate.product && (candidate.resolution === "auto" || event.resolution === candidate.resolution || event.resolution === "auto");
 }
 
@@ -1110,7 +1146,7 @@ async function captureObservedSegment(event) {
   if (event.kind !== "segment") return;
   if (!segmentDirectory) return;
   let sequence = sequenceFromUrl(event.url);
-  let meta = playlistByPath.get(new URL(event.url).pathname);
+  let meta = playlistByUrl.get(normalizedMediaUrl(event.url)) || playlistByPath.get(new URL(event.url).pathname);
   if (!meta && sequence != null && mediaPlaylist) meta = mediaPlaylist.segments.find((item) => item.sequence === sequence);
   if (!meta) {
     log(`暂无法定位分片：${event.url}`);
