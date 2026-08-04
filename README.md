@@ -83,6 +83,8 @@ The extension has one listening switch. Discovery never starts a download by its
 - **Browser-assisted capture:** conservatively save only the HLS or DASH segments actually requested by the player. Keep the task page open for reliable capture and continue playback. If it closes briefly, recent request metadata is queued for a best-effort retry when the task reopens; browser response bodies are not cached.
 - **Ignore this time:** do not create a task.
 
+Detected videos you do not want are dismissable from the download centre: each detection without a download has **Remove this detection**, and a header button clears all of them at once. This only drops the detection record — created downloads, saved files and checkpoints are untouched, and playing the video again detects it again.
+
 The extension never scans or modifies the existing `data/captures` tree. Each new task uses a private resumable workspace or a user-approved custom folder. Temporary HLS pieces have a separate cleanup action. Tasks can also be removed from the download-centre list without deleting saved files or resumable content.
 
 Browser-assisted tasks show missing time ranges. The user-triggered gap filler seeks only those ranges, slows down when the player is not ready, and stops after repeated lack of progress.
@@ -103,7 +105,9 @@ Segments smaller than 188 bytes (one MPEG-TS packet) are never counted as saved.
 
 The same timestamp check watches for a timeline that shifts mid-task, which happens when a long pause is followed by a re-encoded or re-signed source. Web Keeper records a break at that seam, drops stale skippable verdicts, keeps the downloaded segments, and carries on; the merge step re-times the pieces into one file. Seams may still be slightly rough — this is not ffmpeg-grade alignment.
 
-Old `data/captures` folders can be brought into the extension with **Import legacy capture** in the download centre. Pick the captures root, a work folder, or a single quality folder; Web Keeper builds a task from the files already on disk, decrypts them with the neighbouring `file.key`, skips invalid tiny files, and leaves the original folder untouched. What is missing can then be filled with assisted capture as usual.
+Old `data/captures` folders can be brought into the extension with **Import legacy capture** in the download centre. Pick the captures root, a work folder, or a single quality folder. A work folder usually holds several qualities, so the segment count and size of each are listed first and only the largest is preselected — nothing is imported until you confirm.
+
+The default is to **reference the files in place**: segment records point at your original folder, nothing is copied, it finishes in seconds, and decryption happens on read. The trade-off is that the original folder must stay where it is until the video is created. Tick **Also copy into extension storage** if you need the task to be independent of that folder. Whatever is missing can then be filled with assisted capture as usual.
 
 Capture is still a stream-oriented fallback, not a general network-response recorder. Multi-period DASH and complex separate-track streams still require further validation or adaptation.
 

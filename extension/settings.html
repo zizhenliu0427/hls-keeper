@@ -39,6 +39,19 @@
       <label class="field"><span data-i18n="directConcurrency">直接下载速度</span>
         <select id="concurrency"><option value="2" data-i18n="concurrencyStable">稳定（2 路）</option><option value="4" data-i18n="concurrencyBalanced">均衡（4 路，推荐）</option><option value="6" data-i18n="concurrencyFast">较快（6 路）</option></select>
       </label>
+      <label class="field"><span data-i18n="captureConcurrency">网页辅助保存并发</span>
+        <select id="captureConcurrency"><option value="1" data-i18n="captureConcurrencyOne">最保守（1 路）</option><option value="2" data-i18n="captureConcurrencyTwo">稳定（2 路）</option><option value="4" data-i18n="captureConcurrencyFour">均衡（4 路）</option><option value="6" data-i18n="captureConcurrencySix">较快（6 路，推荐）</option><option value="8" data-i18n="captureConcurrencyEight">最快（8 路，可能被站点限流）</option></select>
+      </label>
+      <label class="field"><span data-i18n="pageBufferWait">等待页面已收到的数据</span>
+        <select id="pageBufferWait"><option value="0" data-i18n="pageBufferWaitOff">不等待（最快，可能多走一次网络）</option><option value="1" data-i18n="pageBufferWaitShort">最多 1 秒</option><option value="2.5" data-i18n="pageBufferWaitDefault">最多 2.5 秒（推荐）</option><option value="6" data-i18n="pageBufferWaitLong">最多 6 秒（最省流量）</option></select>
+      </label>
+      <label class="field"><span data-i18n="subtitleConvert">字幕文字转换</span>
+        <select id="subtitleConvert"><option value="none" data-i18n="subtitleConvertNone">不转换（保持原文）</option><option value="zh-hans" data-i18n="subtitleConvertHans">转为简体中文</option><option value="zh-hant" data-i18n="subtitleConvertHant">转为繁体中文</option><option value="en-us" data-i18n="subtitleConvertUs">英式拼写转美式</option><option value="en-gb" data-i18n="subtitleConvertGb">美式拼写转英式</option></select>
+        <span class="muted" data-i18n="subtitleConvertHint">简繁转换使用 OpenCC 词库（按词判断，如“头发→頭髮”、“皇后”不变）。</span>
+      </label>
+      <label class="field"><span data-i18n="subtitleFormat">字幕保存格式</span>
+        <select id="subtitleFormat"><option value="source" data-i18n="subtitleFormatSource">保持原格式</option><option value="srt" data-i18n="subtitleFormatSrt">转为 SRT（兼容性最好）</option><option value="vtt" data-i18n="subtitleFormatVtt">保持 WebVTT</option></select>
+      </label>
       <label class="field"><span data-i18n="completionBehavior">下载完成后</span>
         <span class="check"><input id="autoFinalize" type="checkbox"><span data-i18n="autoFinalize">自动生成可播放视频</span></span>
         <span class="check"><input id="cleanupAfterMerge" type="checkbox"><span data-i18n="cleanupAfterMerge">生成成功后自动删除临时切片</span></span>

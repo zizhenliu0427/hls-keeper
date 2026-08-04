@@ -40,13 +40,17 @@ async function handleRecord(action, value) {
 
 async function refreshDirectory() {
   const record = await handleRecord("get");
-  $("directoryName").textContent = record?.handle?.name || t("noDefaultSaveLocation", null, "首次下载时选择");
+  // A drive root's name is "\\", which on its own reads like a bug rather than a location.
+  const folderName = String(record?.handle?.name || "").trim();
+  $("directoryName").textContent = !folderName
+    ? t("noDefaultSaveLocation", null, "首次下载时选择")
+    : (["\\", "/"].includes(folderName) ? t("driveRootFolder", null, "磁盘根目录（浏览器不提供完整路径）") : folderName);
   $("forgetDirectory").disabled = !record?.handle;
 }
 
 async function load() {
   await WebKeeperI18n.init();
-  const settings = await chrome.storage.local.get({ uiLanguage: "auto", preferredMethod: "ask", defaultQuality: "highest", showDiagnostics: false, autoFinalize: true, cleanupAfterMerge: true, directConcurrency: 4, saveDestination: "browser-downloads" });
+  const settings = await chrome.storage.local.get({ uiLanguage: "auto", preferredMethod: "ask", defaultQuality: "highest", showDiagnostics: false, autoFinalize: true, cleanupAfterMerge: true, directConcurrency: 4, captureConcurrency: 6, pageBufferWaitSec: 2.5, subtitleConvertMode: "none", subtitleFormat: "source", saveDestination: "browser-downloads" });
   $("language").value = settings.uiLanguage;
   $("method").value = settings.preferredMethod;
   $("quality").value = settings.defaultQuality;
@@ -54,6 +58,10 @@ async function load() {
   $("autoFinalize").checked = settings.autoFinalize !== false;
   $("cleanupAfterMerge").checked = settings.cleanupAfterMerge !== false;
   $("concurrency").value = String([2, 4, 6].includes(Number(settings.directConcurrency)) ? Number(settings.directConcurrency) : 4);
+  $("pageBufferWait").value = String([0, 1, 2.5, 6].includes(Number(settings.pageBufferWaitSec)) ? Number(settings.pageBufferWaitSec) : 2.5);
+  $("subtitleConvert").value = ["none", "zh-hans", "zh-hant", "en-us", "en-gb"].includes(settings.subtitleConvertMode) ? settings.subtitleConvertMode : "none";
+  $("subtitleFormat").value = ["source", "vtt", "srt"].includes(settings.subtitleFormat) ? settings.subtitleFormat : "source";
+  $("captureConcurrency").value = String([1, 2, 4, 6, 8].includes(Number(settings.captureConcurrency)) ? Number(settings.captureConcurrency) : 6);
   $("destination").value = settings.saveDestination === "custom-folder" ? "custom-folder" : "browser-downloads";
   syncCompletionOptions();
   syncDestinationOptions();
@@ -91,6 +99,10 @@ $("save").addEventListener("click", async () => {
     autoFinalize: $("autoFinalize").checked,
     cleanupAfterMerge: $("cleanupAfterMerge").checked,
     directConcurrency: Number($("concurrency").value),
+    captureConcurrency: Number($("captureConcurrency").value),
+    subtitleConvertMode: $("subtitleConvert").value,
+    subtitleFormat: $("subtitleFormat").value,
+    pageBufferWaitSec: Number($("pageBufferWait").value),
     saveDestination: $("destination").value
   });
   $("message").textContent = $("language").value === WebKeeperI18n.locale ? t("settingsSaved", null, "设置已保存") : t("reloadForLanguage", null, "语言已更新，重新打开后生效。");

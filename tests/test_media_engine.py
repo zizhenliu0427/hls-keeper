@@ -444,6 +444,281 @@ console.log(JSON.stringify({
         self.assertEqual(1, result["freshToken"])
         self.assertEqual(1, result["unlistedNeighbour"])
 
+    def test_protobuf_and_jwt_helpers_recover_the_subtitle_viewer_id(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const payload = 'U29tZUNpcGhlcg==';
+const bytes = new Uint8Array([0x0a, payload.length, ...Buffer.from(payload)]);
+const jwt = 'h.' + Buffer.from(JSON.stringify({ uid: 987654 })).toString('base64url') + '.s';
+console.log(JSON.stringify({
+  field: e.protobufStringField(bytes, 1),
+  missingField: e.protobufStringField(bytes, 2),
+  fromHeader: e.subtitleUserIdFromHeaders({ authorization: 'Bearer ' + jwt }),
+  fromCookie: e.subtitleUserIdFromHeaders({ cookie: 'a=1; access_token=' + jwt }),
+  none: e.subtitleUserIdFromHeaders({ cookie: 'a=1' })
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual("U29tZUNpcGhlcg==", result["field"])
+        self.assertIsNone(result["missingField"])
+        self.assertEqual("987654", result["fromHeader"])
+        self.assertEqual("987654", result["fromCookie"])
+        self.assertIsNone(result["none"])
+
+    def test_subtitle_conversion_and_segmented_timeline(self) -> None:
+        newline = chr(92) + "n"
+        source = """
+const e = require('./extension/media-engine.js');
+const parts = [
+  'WEBVTT@X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000@@00:00:01.000 --> 00:00:03.000@first',
+  'WEBVTT@X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:1800000@@00:00:01.000 --> 00:00:03.000@second'
+];
+console.log(JSON.stringify({
+  hans: e.convertSubtitleText('\u9019\u500b\u756b\u8cea\u5f88\u597d\uff0c\u8acb\u9ede\u9078', 'zh-hans'),
+  hant: e.convertSubtitleText('\u8fd9\u4e2a\u753b\u8d28\u5f88\u597d', 'zh-hant'),
+  us: e.convertSubtitleText('The Colour of the theatre', 'en-us'),
+  gb: e.convertSubtitleText('The color of the theater', 'en-gb'),
+  untouched: e.convertSubtitleText('unchanged text', 'none'),
+  merged: e.mergeWebVttParts(parts)
+}));
+""".replace("@", newline)
+        result = self.run_node(source)
+        self.assertEqual("\u8fd9\u4e2a\u753b\u8d28\u5f88\u597d\uff0c\u8bf7\u70b9\u9009", result["hans"])
+        self.assertEqual("\u9019\u500b\u756b\u8cea\u5f88\u597d", result["hant"])
+        # Capitalisation must survive the spelling swap.
+        self.assertEqual("The Color of the theater", result["us"])
+        self.assertEqual("The colour of the theatre", result["gb"])
+        self.assertEqual("unchanged text", result["untouched"])
+        # The second part is anchored 10s later (MPEGTS delta 900000 / 90kHz), so its cue moves.
+        self.assertIn("00:00:01.000 --> 00:00:03.000", result["merged"])
+        self.assertIn("00:00:11.000 --> 00:00:13.000", result["merged"])
+        self.assertNotIn("X-TIMESTAMP-MAP", result["merged"])
+
+    def test_srt_conversion_and_unconverted_chinese_reporting(self) -> None:
+        newline = chr(92) + "n"
+        source = """
+const e = require('./extension/media-engine.js');
+const vtt = 'WEBVTT@@NOTE hi@@1@00:00:01.500 --> 00:00:03.250 align:start@<b>Hello</b> there@@00:01:02.000 --> 00:01:04.000@later';
+console.log(JSON.stringify({
+  srt: e.webVttToSrt(vtt),
+  unmapped: e.unconvertedChineseCount('\u9019\u500b\u8996\u983b', 'zh-hans'),
+  none: e.unconvertedChineseCount('\u9019\u500b', 'none')
+}));
+""".replace("@", newline)
+        result = self.run_node(source)
+        self.assertIn("00:00:01,500 --> 00:00:03,250", result["srt"])
+        self.assertIn("Hello there", result["srt"])
+        self.assertNotIn("align:start", result["srt"])
+        self.assertNotIn("WEBVTT", result["srt"])
+        self.assertTrue(result["srt"].startswith("1"))
+        # The built-in table has no rule for these two, which is what the warning reports.
+        self.assertEqual(2, result["unmapped"])
+        self.assertEqual(0, result["none"])
+
+    def test_subtitle_parts_merge_without_duplicates(self) -> None:
+        # The player fetches the track in chunks that overlap at the seams and arrive in
+        # whatever order the requests were recorded, so merging must dedupe and re-sort.
+        newline = chr(92) + "n"
+        source = """
+const e = require('./extension/media-engine.js');
+const later = 'WEBVTT@@00:05:00.000 --> 00:05:02.000@third@@00:02:30.000 --> 00:02:32.000@second';
+const early = 'WEBVTT@@00:00:01.000 --> 00:00:02.000@first@@00:02:30.000 --> 00:02:32.000@second';
+const merged = e.mergeVttDocuments([later, early]);
+console.log(JSON.stringify({
+  merged,
+  headers: (merged.match(/WEBVTT/g) || []).length,
+  seconds: (merged.match(/^second$/gm) || []).length,
+  order: (merged.match(/^(?:first|second|third)$/gm) || [])
+}));
+""".replace("@", newline)
+        result = self.run_node(source)
+        self.assertEqual(1, result["headers"])
+        self.assertEqual(1, result["seconds"])
+        self.assertEqual(["first", "second", "third"], result["order"])
+
+    def test_subtitle_paging_is_inferred_and_extrapolated(self) -> None:
+        # Two recorded calls differ only in their window, which is what makes the rest of the
+        # track requestable without replaying playback.
+        source = r"""
+const e = require('./extension/media-engine.js');
+function varint(value) { const out = []; let rest = value; do { const part = rest % 128; rest = Math.floor(rest / 128); out.push(rest > 0 ? part | 0x80 : part); } while (rest > 0); return out; }
+// field 1 = start (varint), field 2 = end (varint), field 3 = "vid" (string)
+function body(start, end) { return Uint8Array.from([0x08, ...varint(start), 0x10, ...varint(end), 0x1a, 3, 118, 105, 100]); }
+const paging = e.inferSubtitlePaging([body(0, 300), body(300, 600)]);
+const next = paging.fields.reduce((bytes, field) => e.protobufSetVarint(bytes, field.field, field.max + paging.step), body(300, 600));
+const framed = e.grpcWebFrame(next);
+console.log(JSON.stringify({
+  paging,
+  // 300 needs two varint bytes where 0 needed one, so the message must have been rebuilt.
+  fields: e.protobufVarintFields(next),
+  id: e.protobufStringField(next, 3),
+  framedPrefix: Array.from(framed.subarray(0, 5)),
+  roundTrip: e.protobufVarintFields(e.grpcWebPayload(framed)),
+  ambiguous: e.inferSubtitlePaging([body(0, 300), body(300, 900)]),
+  single: e.inferSubtitlePaging([body(0, 300)])
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual(300, result["paging"]["step"])
+        self.assertEqual([{"field": 1, "max": 300}, {"field": 2, "max": 600}], result["paging"]["fields"])
+        self.assertEqual({"1": 600, "2": 900}, result["fields"])
+        # Rebuilding the message must not disturb the other fields.
+        self.assertEqual("vid", result["id"])
+        # 1+2 (start) + 1+2 (end) + 1+1+3 (id) = 11 bytes, declared in the 5-byte gRPC-Web prefix.
+        self.assertEqual([0, 0, 0, 0, 11], result["framedPrefix"])
+        self.assertEqual({"1": 600, "2": 900}, result["roundTrip"])
+        # Fields moving at different rates, or a single call, give nothing safe to extrapolate.
+        self.assertIsNone(result["ambiguous"])
+        self.assertIsNone(result["single"])
+
+    def test_grpc_web_text_frames_are_decoded_when_concatenated(self) -> None:
+        # grpc-web-text base64-encodes each frame separately, so "=" padding lands in the middle
+        # and atob() over the whole string throws. Falling back to the raw text made a good
+        # 241 kB reply look like an unknown format.
+        source = r"""
+const e = require('./extension/media-engine.js');
+function field(number, text) { const body = Buffer.from(text, 'utf8'); return [number * 8 + 2, body.length, ...body]; }
+function frame(bytes) { return [0, 0, 0, (bytes.length >>> 8) & 255, bytes.length & 255, ...bytes]; }
+const one = Buffer.from(frame(field(1, 'first-message'))).toString('base64');
+const two = Buffer.from(frame(field(1, 'second'))).toString('base64');
+// Each frame is padded on its own; the concatenation is not valid base64.
+const wire = Uint8Array.from(Buffer.from(one + two, 'utf8'));
+console.log(JSON.stringify({
+  padded: one.includes('=') || two.includes('='),
+  values: e.grpcWebPayloads(wire).map((f) => e.protobufStringField(f, 1)),
+  wholeStringFails: (() => { try { atob(one + two); return false; } catch { return true; } })()
+}));
+"""
+        result = self.run_node(source)
+        self.assertTrue(result["padded"], "the fixture must reproduce mid-string padding")
+        self.assertTrue(result["wholeStringFails"], "the fixture must be undecodable in one atob call")
+        self.assertEqual(["first-message", "second"], result["values"])
+
+    def test_segment_index_is_a_well_formed_sidx(self) -> None:
+        # A fragmented MP4 with no index forces a player to walk every fragment before it can
+        # start, which on a network share is minutes. The box is parsed back the way a player
+        # reads it, per ISO/IEC 14496-12 8.16.3 — the version-1 header is 40 bytes, and getting
+        # that wrong is exactly the mistake this catches.
+        source = r"""
+const e = require('./extension/media-engine.js');
+const refs = [{ size: 1000, duration: 180000 }, { size: 2500, duration: 90000 }, { size: 4096, duration: 90000 }];
+const box = e.buildSidx(refs, { timescale: 90000 });
+const view = new DataView(box.buffer, box.byteOffset, box.byteLength);
+const parsed = [];
+const count = view.getUint16(38);
+for (let i = 0; i < count; i += 1) {
+  const at = 40 + i * 12;
+  const word = view.getUint32(at);
+  const flags = view.getUint32(at + 8);
+  parsed.push({ type: word >>> 31, size: word & 0x7fffffff, duration: view.getUint32(at + 4), sap: flags >>> 31, sapType: (flags >>> 28) & 7 });
+}
+const free = e.buildFreeBox(64);
+console.log(JSON.stringify({
+  name: String.fromCharCode.apply(null, Array.from(box.subarray(4, 8))),
+  declared: view.getUint32(0),
+  actual: box.byteLength,
+  helper: e.sidxByteLength(refs.length),
+  version: view.getUint8(8),
+  timescale: view.getUint32(16),
+  count,
+  parsed,
+  freeName: String.fromCharCode.apply(null, Array.from(free.subarray(4, 8))),
+  freeSize: new DataView(free.buffer).getUint32(0)
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual("sidx", result["name"])
+        self.assertEqual(result["actual"], result["declared"], "declared size must match the buffer")
+        self.assertEqual(result["actual"], result["helper"], "reserved space must match what is written")
+        self.assertEqual(40 + 3 * 12, result["actual"])
+        self.assertEqual(1, result["version"])
+        self.assertEqual(90000, result["timescale"])
+        self.assertEqual(3, result["count"])
+        self.assertEqual([1000, 2500, 4096], [item["size"] for item in result["parsed"]])
+        self.assertEqual([180000, 90000, 90000], [item["duration"] for item in result["parsed"]])
+        # reference_type 0 means media; every fragment starts at a keyframe (SAP type 1).
+        self.assertEqual([0, 0, 0], [item["type"] for item in result["parsed"]])
+        self.assertEqual([1, 1, 1], [item["sap"] for item in result["parsed"]])
+        self.assertEqual([1, 1, 1], [item["sapType"] for item in result["parsed"]])
+        self.assertEqual("free", result["freeName"])
+        self.assertEqual(64, result["freeSize"])
+
+    def test_streaming_reply_and_repeated_fields_are_read_whole(self) -> None:
+        # A server-streaming gRPC-Web reply is several DATA frames in one response, and one frame
+        # can repeat the payload field. Reading only the first of either truncates the track.
+        source = r"""
+const e = require('./extension/media-engine.js');
+function field(number, text) { const body = Buffer.from(text, 'utf8'); return [number * 8 + 2, body.length, ...body]; }
+function frame(bytes) { return [0, (bytes.length >>> 24) & 255, (bytes.length >>> 16) & 255, (bytes.length >>> 8) & 255, bytes.length & 255, ...bytes]; }
+const first = [...field(1, 'alpha'), ...field(1, 'beta')];
+const second = [...field(1, 'gamma')];
+// Frames 1 and 2 carry data; the third is a trailer and must be skipped.
+const trailer = [128, 0, 0, 0, 2, 65, 66];
+const response = Uint8Array.from([...frame(first), ...frame(second), ...trailer]);
+const frames = e.grpcWebPayloads(response);
+console.log(JSON.stringify({
+  frameCount: frames.length,
+  repeated: frames.map((f) => e.protobufStringFields(f, 1)),
+  firstOnly: e.protobufStringField(frames[0], 1),
+  legacy: e.protobufStringField(e.grpcWebPayload(response), 1),
+  notFramed: e.grpcWebPayloads(Uint8Array.from(field(1, 'plain'))).length
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual(2, result["frameCount"])
+        self.assertEqual([["alpha", "beta"], ["gamma"]], result["repeated"])
+        # The single-value accessors still behave as before, so existing callers are unaffected.
+        self.assertEqual("alpha", result["firstOnly"])
+        self.assertEqual("alpha", result["legacy"])
+        # An unframed body is still returned as one payload rather than dropped.
+        self.assertEqual(1, result["notFramed"])
+
+    def test_single_call_yields_ordered_paging_probes(self) -> None:
+        # With one recorded call there is nothing to difference, so the cursor has to be guessed
+        # and then verified. The guesses must be ordered so the likeliest shape costs one request.
+        source = r"""
+const e = require('./extension/media-engine.js');
+function varint(value) { const out = []; let rest = value; do { const part = rest % 128; rest = Math.floor(rest / 128); out.push(rest > 0 ? part | 0x80 : part); } while (rest > 0); return out; }
+// field 1 = 0 (position), field 2 = 7 (some flag), field 3 = "vid"
+const payload = Uint8Array.from([0x08, ...varint(0), 0x10, ...varint(7), 0x1a, 3, 118, 105, 100]);
+const span = e.subtitleCueSpan('WEBVTT\n\n00:00:02.000 --> 00:00:04.000\na\n\n00:04:58.000 --> 00:05:02.000\nb');
+console.log(JSON.stringify({
+  span,
+  probes: e.subtitlePagingProbes(payload, span),
+  empty: e.subtitleCueSpan('WEBVTT').count
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual(2, result["span"]["start"])
+        self.assertEqual(302, result["span"]["end"])
+        self.assertEqual(2, result["span"]["count"])
+        # A 300s chunk: seconds first, then milliseconds, then a plain page index, and the string
+        # field is never probed because it cannot be a varint cursor.
+        self.assertEqual([300, 300, 300000, 300000, 1, 1], [probe["step"] for probe in result["probes"]])
+        self.assertEqual([1, 2, 1, 2, 1, 2], [probe["field"] for probe in result["probes"]])
+        self.assertEqual([300, 307, 300000, 300007, 1, 8], [probe["value"] for probe in result["probes"]])
+        self.assertEqual(0, result["empty"])
+
+    def test_grpc_web_framing_is_unwrapped_before_protobuf(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const payload = 'QUJDREVGRw==';
+const message = Buffer.concat([Buffer.from([0x0a, payload.length]), Buffer.from(payload)]);
+const frame = Buffer.concat([Buffer.from([0x00, 0, 0, 0, message.length]), message]);
+const trailer = Buffer.concat([Buffer.from([0x80, 0, 0, 0, 4]), Buffer.from('abcd')]);
+const framed = new Uint8Array(Buffer.concat([frame, trailer]));
+console.log(JSON.stringify({
+  framed: e.protobufStringField(e.grpcWebPayload(framed), 1),
+  rawFails: e.protobufStringField(framed, 1),
+  plainStillWorks: e.protobufStringField(e.grpcWebPayload(new Uint8Array(message)), 1)
+}));
+"""
+        result = self.run_node(source)
+        self.assertEqual("QUJDREVGRw==", result["framed"])
+        # Without unwrapping, the 5-byte header is read as a field and the value is lost.
+        self.assertNotEqual("QUJDREVGRw==", result["rawFails"])
+        self.assertEqual("QUJDREVGRw==", result["plainStillWorks"])
+
     def test_direct_candidate_prefers_complete_video_over_audio(self) -> None:
         source = r"""
 const e = require('./extension/media-engine.js');

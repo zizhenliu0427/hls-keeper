@@ -4,6 +4,64 @@
 
 这一段是补记：0.4.0–0.4.6 的实现先于文档完成，本节按代码实际行为回填。常量都在 `extension/download.js` 顶部，判定逻辑在 `extension/media-engine.js`。
 
+### 清晰度只显示一档、直接下载卡住、有效性检查误删（2026-08-04）
+
+- **只有 720p**：清晰度不是从主播放列表解析的，而是从**浏览器实际请求过的 URL 路径**（`/1280x720/`）里认出来的，所以播放器菜单里有 1080p/720p/404p/270p，扩展却只显示「1 个清晰度」。background 新增 `masterPlaylistVariants` / `expandMasterPlaylist`：记录到播放列表候选时读一次主播放列表，把每个 `EXT-X-STREAM-INF` 都登记成可选清晰度（`fromMasterPlaylist: true`，避免递归展开）。URL 里没有分辨率时用 `RESOLUTION` 属性补上。
+- **大量缺片时直接下载卡住**：`runHlsDirect` 把整批分片交给 `mapConcurrent`，**任何一个分片抛错就整批 reject**，一条过期 URL 能把其余几千个一起带走。现在每个分片自带 `DIRECT_SEGMENT_RETRIES`（3 次，退避 400/800 ms），仍失败就记下并跳过，本轮结束后报「N/M 个暂未保存」；只有**全部**失败（且 ≥5 个）才当作会话过期抛出。
+- **有效性检查误删可用分片**：`readStoredSegment` 在播放列表里找不到对应条目时退回 `{ sequence }`（无 key），`decryptIfNeeded` 于是**原样返回密文** —— 密文当然不是 TS，被判无效并**删除**。现在分三类：有效 / 确定无效（尺寸不对，或明文且非 TS/MP4）/ **无法判定**（加密未解开、原文件读不到）；只删「确定无效」，其余原样保留并单独报数（`verifyUndecided`）。
+- 顺带：`pytest.ini` 限定 `testpaths = tests`，否则收集阶段会走进 `data/captures`（正在下载的目录会中途消失，导致整轮 FileNotFoundError）。
+
+### 外挂字幕：从「检测不到」到「分段合并」（2026-08-04）
+
+用户的站点把字幕放在一个 gRPC-Web 接口后面，一路排查下来是六层问题，逐层都已修：
+
+- **只认扩展名**：检测端原本要求 `.vtt/.srt/...`，这个接口的 URL 没有扩展名。现在 `recordResponseCandidate` 也按 content-type 或路径含 `subtitle` 归类，记进 `item.subtitleTypes`。
+- **HLS 侧轨没收**：`EXT-X-MEDIA:TYPE=SUBTITLES` 指向的媒体播放列表会被当成主播放列表，`discoverSubtitles` 现在会区分主/媒体播放列表并按 `EXT-X-MEDIA` 拉侧轨。
+- **GET 返回 415**：这是个只接受 POST 的 gRPC-Web 接口。`background.js` 用 `onBeforeRequest` + `["requestBody"]` 把原始请求体录下来（base64，`pendingSubtitleRequests`，120 秒过期），任务页原样重放，`content-type` 加进 `allowedHeaders` 白名单。
+- **响应看不懂**：响应是 gRPC-Web 分帧（5 字节前缀）包 protobuf 包 base64 包 AES-CBC。`grpcWebPayload` / `protobufStringField` / `decodeEncryptedSubtitle` 逐层拆开；密钥随 `subtitleUserIdFromHeaders`（JWT payload）派生。
+- **只有几分钟**：播放器**按播放进度分段**调用同一个地址，每次请求体的分页参数不同。原来每个 URL 只存一次调用，所以只拿到一段。现在 `item.subtitleCalls` 按请求体去重保留全部调用（上限 200 条），任务页重放**每一条**并用 `mergeVttDocuments` 合并 —— 按 `起始时间|正文` 去重、按时间排序、只保留一个 `WEBVTT` 头，所以重复保存不会产生重复字幕。
+- **覆盖不足要说出来**：`subtitleCoverageSeconds` 取最后一条 cue 的结束时间，不足视频时长 90% 时报 `subtitleCoverageShort`（覆盖到哪 / 视频多长 / 怎么补）；只录到一次调用时另报 `subtitlePartialCoverage`。
+
+补齐不再需要用户手动重播，两条路，先自动后兜底：
+
+- **最终结果**：2312 条、覆盖 00:00–08:00:38，与视频等长。两处缺一不可 —— (1) 请求要带**字幕请求自己的头**（会员 token 决定给全片还是 5 分钟预览；此前用的是播放列表请求的头，一个 token 都没有），(2) AES 的 IV 由登录用户 ID 推导，而该 ID 未必在请求头里，改为收集页面 localStorage/sessionStorage/cookie 里的 JWT 与数字 ID，**逐个试解密并用文本里有没有 `-->` 判定**，成功的身份缓存在内存里。这些值只用于在内存里构造 IV，不落盘、不进诊断报告。
+- **清晰度名要以 manifest 为准**：URL 路径里的 `720p` 是营销名，实际编码是 `720x404`。`expandMasterPlaylist` 一度让 URL 标签压过 `EXT-X-STREAM-INF` 的 `RESOLUTION`，导致文件夹名与真实分辨率对不上。现在 manifest 优先，URL 只作兜底。
+- **真正的根因（av.jkforum.net，2026-08-04 由用户 DevTools 定案）**：播放器那次 `AvideoSubtitle` 的响应是 **246 kB**，我们重放同一个请求体拿到的是 **5547 字节**。同一个 body、不同的答复 —— 差别在**身份**。扩展页面（`chrome-extension://`）发出的是跨源匿名请求，带不上会员会话（接口清单里 `UseTicket` / `IsAvPlus` / `CheckMember` 印证了这是会员分级站点），服务器只给免费预览的 4:54。新增 `postInPage`：用 `chrome.scripting.executeScript`（`world: "MAIN"`）**在网页自己的上下文里**发这个 POST，再把字节 base64 回传。`requestSubtitleRaw` 优先走这条路，失败才退回扩展页面直连。**在此之前所有关于分页、流式多帧、repeated 字段、站点只有 5 分钟的推断都是错的** —— 它们解释的是同一个被身份阉割过的响应。
+- **实测结论（旧，已被上一条推翻）**：`字幕接口诊断` 导出的真实形状是 —— 请求 `1=int:1159810`（只有视频 ID），响应 5547 字节 / **1 帧** / 密文 5504 字节，完整解出 2676 字符 56 条、覆盖 00:00–04:54。**没有分页，也没有截断**：这个接口只接受视频 ID，返回什么就是全部。此前关于「分页游标」「服务端流式多帧」「repeated 字段」的三个假设对这个站点都不成立 —— 相关代码保留（对真正分页的接口仍然有效），但不再是这里的解释。`subtitlePagingAbsent` 现在在花请求去试探之前先判断这种「只带 ID」的形状，直接给出结论，不再让用户去追一个不存在的游标。
+- **多帧 / repeated 密文**（对其他站点仍然重要）
+- **回复本身就是完整的，是我们只读了 1/N**：`grpcWebPayload` 只返回 `frames[0]`，而 gRPC-Web 回复可以是**服务端流式**的 —— 一个 HTTP 响应里很多个 DATA 帧；同样 `protobufStringField` 只取该字段的第一个值，而密文字段是 **repeated** 的。于是「8 小时的视频只有 56 条字幕、覆盖 4:54」「改任何整数参数都返回同一段」「播放器走一遍录不到新调用」三件事同时成立 —— 因为根本没有分页，是解码截断了。新增 `grpcWebPayloads` / `protobufStringFields`，`decodeEncryptedSubtitle` 解出**每一帧的每一条**密文再 `mergeVttDocuments` 合并；单条密文解密失败不再丢弃其余部分。旧的单值访问器保持原语义，其他调用方不受影响。
+- **只录到一次调用时靠试探**（`probeSubtitlePaging`）：差分需要两次调用，但常见情况就是只录到一次。此时逐个改动请求体里的整数字段再问一次，**用返回内容验证** —— 只有当回复真的伸到了原来那段之后才认这个字段。`subtitlePagingProbes` 按「秒 → 毫秒 → 页序号」排出候选（步长取本段时长），上限 `SUBTITLE_PROBE_LIMIT`（24）次请求。服务器忽略的字段会原样返回同一段，自动被否掉。全试完还不动就明说游标不是简单数字（多半是字符串 token），请改用播放器兜底。
+- **页面缓冲区不能提前返回**：`fetchSubtitleContent` 第一步会取网页已经收到的字节，原来命中后 `if (!buffer)` 把整个重放 + 扩展分支**全跳过了**，于是保存成功但内容和以前一模一样。现在：这个地址有已录调用（说明是分段接口）时，缓冲副本降级为**第一段**而不是全部答案；没有已录调用时（普通 .vtt/.srt 侧轨）保持原样返回，不会被 `mergeVttDocuments` 改写格式。
+- **结果必须自报**：拼完无条件记一条 `subtitleAssembled`（几段拼成 / 多少条 cue / 覆盖区间），「保存了但很短」不再需要猜。
+- **旧版本存下的调用要认**：`subtitleCalls` 数组是这一版才有的，更早的版本只写 `subtitleRequests`（每个 URL 一条）。`refreshSubtitleCalls` 现在把这张表也 seed 进来 —— 否则会出现「保存字幕能成功，却报录到 0 段」这种自相矛盾的状态。
+- **直接抽取（默认，无需网页）**：`inferSubtitlePaging` 对已录到的请求体**做差分** —— 解出 protobuf 里的整数字段（`protobufVarintFields`），凡是在多次调用之间变化的就是分页游标，变化间距就是页长。start/end 这类成对移动的字段允许一起变，但**步长必须一致**；只有一次调用、或多个字段以不同速率变化时返回 `null`，不做任何猜测（会提示改用播放器兜底）。随后 `protobufSetVarint` 重新编码该字段（新值字节数可能不同，所以是重建而非原地打补丁）、`grpcWebFrame` 重新分帧，把游标推到播放器从未请求过的范围。停止条件是**这一页的覆盖不再前进**（即到了轨道末尾），`SUBTITLE_SWEEP_LIMIT`（400）只防游标不终止；每次请求之间 120 ms 节流。
+- **让播放器走一遍（兜底，需接上网页）**：`sweepPlayerForSubtitles` 复用 capture 的 `stepSeekForward` 驱动播放器走完全片，由站点自己发字幕请求、background 记录，边走边 `refreshSubtitleCalls` 显示「新录到 N 段 / 当前位置」，随时可停。这条路对任何分页格式都有效（包括字符串游标）。走完自动保存，已有部分自动合并。任务已完成或暂停时 `stepSeekForward` 需要 `{ ignorePause: true }`，否则捕获用的暂停守卫会让每一步变成空操作。
+
+产品承诺的边界因此变成：**字幕能覆盖到分页游标可推进的范围**；只有当游标规律无法从录到的调用中解出时，才退回「播放器实际请求过的范围」。
+
+简繁 / 英美转换用的是内置字表，只覆盖常用字。`unconvertedChineseCount` 统计样本里没有规则的汉字，设置页和运行日志都会明说，不假装是完整转换。输出格式可选「源格式 / SRT / VTT」（`applySubtitleFormat`），选 SRT 时 `webVttToSrt` 会去掉 `WEBVTT`、NOTE、cue 设置并把 `.` 换成 `,`。
+
+当前自动化测试 50 项通过（含 `node tests/smoke_download_page.js` 真实加载 `download.js` 的冒烟测试）。字幕链路的真实站点验收由用户在自己的目标站点进行。
+
+### 导入旧库的三个严重问题（2026-08-04 修正）
+
+用户实测：导入 `idbd00965`（`1280x720` 有 9360 个 .ts，播放列表 12959 条，缺 3599 片）时，导到九千多片后进度显示满、自动切到低清晰度继续，最后浏览器崩溃。三个原因都已修：
+
+- **自动导入所有清晰度**：`importLegacyCapture` 原本 `for (const variant of variants)` 把作品夹下每个清晰度依次导一遍。现在先扫描并列出每档的分片数和体积，默认只勾最大的那档，用户确认后才开始（`chooseLegacyVariants`）。
+- **收尾的缺口判定读了数 GB 且不让出主线程**：`reclassifySkippableGaps` 会对每个缺口读前后各 512 KB；几千个缺口直接把标签页内存打爆。现在每轮上限 `MAX_RECLASSIFY_PER_PASS`（120）、每 10 个 `await waitFor(0)`，其余缺口留到后续轮次。
+- **O(N²) 状态复制**：`segmentSkipVerdicts` 每次都整份展开复制、`skippableSequences` 每次插入都排序、`skippableSequenceSet()` 每次调用都重建 Set，导入时还每 12 个分片就把整份状态写进 IndexedDB。现在改为原地写入（`recordSkipVerdict`，上限 400 条诊断记录）、去掉排序、按任务缓存 Set，落盘改为最多每 500 ms 一次。
+- 顺带把 `playlistSegmentBySequence` 从线性 `find` 改成按 sequence 的 Map，合并长作品时同样是 O(N²)。
+
+### 导入改为「就地引用」而不是复制（默认行为）
+
+用户的真实诉求是**查漏补缺**，而原实现是把本地 9360 个分片解密后**复制**进扩展存储（这一个作品约 10 GB），既慢又翻倍占盘。现在默认不复制：
+
+- 分片记录写成 `source: "legacy-link"`，`fileName` 指向原目录里的文件名；变体目录句柄存进 `handles` store（`legacy:<jobId>`）。
+- 新增统一读取器 `readStoredSegment(record, meta)` / `storedSegmentSize(record)`：链接记录从原目录读原始字节并**读时解密**，普通记录仍从任务空间读。合并、TS 转封装、fMP4 拼接、PTS 采样、`reconcileSaved` 全部改走这条路。
+- 重开任务时 `loadMediaPlaylist` 会先走 `loadLocalLegacyPlaylist` 读任务空间里的 `source.m3u8` 并用 `file.key` 重建解密缓存，因此读时解密在重启后仍可用。
+- 目录授权失效时 `ensureLegacySource` 会在用户操作（合并）时请求重新授权，失败则明确报 `legacySourceUnavailable`，不会静默产出坏文件。
+- 仍保留「复制一份到扩展存储」勾选项（默认关）。选择复制则原目录可随意移动；选择链接则**生成视频前不能移动或删除原目录**，导入完成的提示里会写明。
+
 ### 0.4.0 导入旧 `data/captures`
 
 产品行为见 §4.2.4，这里只补实现细节：

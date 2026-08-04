@@ -14,7 +14,14 @@
     catch { return String(value || ""); }
   }
 
+  function isSubtitleResponse(url) {
+    return /subtitle/i.test(String(url || ""));
+  }
+
   function isMediaResponse(url, contentType) {
+    // A subtitle API answers a POST with a body we cannot reproduce with a plain GET, so keep
+    // whatever the player already received.
+    if (isSubtitleResponse(url)) return true;
     const type = String(contentType || "").toLowerCase();
     if (/mpegurl|dash\+xml|text\/html|application\/json|text\/vtt/.test(type)) return false;
     if (/^(?:video|audio)\//.test(type)) return true;
@@ -80,6 +87,12 @@
         if (body instanceof ArrayBuffer) remember([requestUrl, responseUrl], new Uint8Array(body));
         else if (typeof Blob === "function" && body instanceof Blob) {
           body.arrayBuffer().then((data) => remember([requestUrl, responseUrl], new Uint8Array(data))).catch(() => { /* blob gone */ });
+        } else if (typeof body === "string" || typeof request.responseText === "string") {
+          // A grpc-web-text reply is read as text, so the default responseType hands back a string.
+          // Dropping those meant the player's own copy was never buffered and we fell back to
+          // re-requesting it, which the server answers with a short preview.
+          const text = typeof body === "string" ? body : request.responseText;
+          if (text) remember([requestUrl, responseUrl], new TextEncoder().encode(text));
         }
       } catch { /* never disturb the player */ }
     });

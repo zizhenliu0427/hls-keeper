@@ -5,49 +5,140 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title data-i18n="downloadCenter">下载中心</title>
   <style>
-    :root { color-scheme: light dark; --bg:#f3f6fb; --card:#fff; --soft:#f7f9fc; --line:#d9e1ec; --text:#172033; --muted:#667085; --blue:#2563eb; --green:#15803d; --red:#b42318; font-family:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif; }
-    @media (prefers-color-scheme:dark) { :root { --bg:#0c1422; --card:#131d2f; --soft:#19253a; --line:#2b3a52; --text:#e7edf7; --muted:#9aa9bd; --blue:#3b82f6; --green:#4ade80; --red:#fb7185; } }
+    :root {
+      color-scheme: light dark;
+      --bg:#f4f6fa; --card:#fff; --soft:#f7f9fc; --sunken:#eef2f8;
+      --line:#dde4ee; --line-strong:#c6d1e0;
+      --text:#141c2b; --muted:#657189;
+      --accent:#2563eb; --accent-ink:#fff; --accent-soft:color-mix(in srgb, var(--accent) 10%, var(--card));
+      --ok:#15803d; --bad:#b42318;
+      --r-sm:8px; --r-md:11px; --r-lg:16px;
+      --gap:14px;
+      --shadow:0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.06);
+      --shadow-pop:0 8px 24px rgba(16,24,40,.14);
+      --ease:cubic-bezier(.2,.7,.3,1);
+      --fast:120ms; --slow:220ms;
+      font-family:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+    }
+    @media (prefers-color-scheme:dark) {
+      :root {
+        --bg:#0b1220; --card:#141d2e; --soft:#1a2438; --sunken:#101a2b;
+        --line:#28344a; --line-strong:#3a4a66;
+        --text:#e8eef8; --muted:#98a6bd;
+        --accent:#3b82f6; --accent-ink:#08111f;
+        --ok:#4ade80; --bad:#fb7185;
+        --shadow:0 1px 2px rgba(0,0,0,.3); --shadow-pop:0 10px 30px rgba(0,0,0,.5);
+      }
+    }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 system-ui,"Microsoft YaHei UI",sans-serif; }
-    header { background:var(--card); border-bottom:1px solid var(--line); padding:17px 22px; }
-    header div { max-width:980px; margin:auto; display:flex; align-items:center; justify-content:space-between; gap:16px; }
-    h1 { margin:0; font-size:20px; }
-    main { max-width:980px; margin:22px auto; padding:0 16px 40px; display:grid; gap:14px; }
-    .card { min-width:0; overflow:hidden; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; }
-    .hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:start; }
-    .title { font-size:20px; font-weight:750; overflow-wrap:anywhere; }
+
+    header { position:sticky; top:0; z-index:20; background:color-mix(in srgb, var(--card) 88%, transparent); backdrop-filter:blur(8px); border-bottom:1px solid var(--line); padding:14px 22px; }
+    header > div { max-width:1000px; margin:auto; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    h1 { margin:0; font-size:18px; letter-spacing:-.01em; }
+    nav { display:flex; align-items:center; gap:8px; }
+    main { max-width:1000px; margin:20px auto; padding:0 16px 56px; display:grid; gap:var(--gap); }
+
+    .card { min-width:0; background:var(--card); border:1px solid var(--line); border-radius:var(--r-lg); padding:20px; box-shadow:var(--shadow); }
+
+    /* ---- hero: what this is, what state it is in, and the one thing to do next ---- */
+    .hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; }
+    .title { font-size:19px; font-weight:700; letter-spacing:-.01em; overflow-wrap:anywhere; }
     .muted { color:var(--muted); }
-    .pill { display:inline-flex; padding:4px 10px; border-radius:999px; background:var(--soft); border:1px solid var(--line); color:var(--muted); }
-    .pill.ok { color:var(--green); }
-    .pill.bad { color:var(--red); }
-    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
-    .stat { background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:11px; }
-    .stat strong { display:block; font-size:18px; }
-    progress { width:100%; height:13px; margin:15px 0 5px; accent-color:var(--blue); }
-    .actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:14px; }
-    .speed { display:inline-flex; align-items:center; gap:7px; padding:0 11px; border:1px solid var(--line); border-radius:9px; background:var(--card); font-weight:650; }
+    .pill { display:inline-flex; align-items:center; gap:6px; padding:5px 11px; border-radius:999px; background:var(--soft); border:1px solid var(--line); color:var(--muted); font-size:13px; white-space:nowrap; }
+    .pill::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.7; }
+    .pill.ok { color:var(--ok); }
+    .pill.bad { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 40%, var(--line)); }
+    .pill.busy::before { animation:wk-pulse 1.6s var(--ease) infinite; }
+    @keyframes wk-pulse { 0%,100% { opacity:.25; } 50% { opacity:1; } }
+
+    /* ---- progress ---- */
+    #progressWrap { margin-top:18px; }
+    progress { width:100%; height:8px; margin:0; accent-color:var(--accent); border:0; border-radius:999px; background:var(--sunken); }
+    progress::-webkit-progress-bar { background:var(--sunken); border-radius:999px; }
+    progress::-webkit-progress-value { background:var(--accent); border-radius:999px; transition:width var(--slow) var(--ease); }
+    #coverage { width:100%; height:24px; display:block; margin-top:10px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--sunken); }
+    #progressText { margin-top:8px; font-variant-numeric:tabular-nums; }
+
+    #stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:16px; }
+    .stat { background:var(--soft); border:1px solid var(--line); border-radius:var(--r-md); padding:12px 13px; }
+    .stat > span { font-size:12px; }
+    .stat strong { display:block; font-size:19px; font-weight:700; letter-spacing:-.01em; font-variant-numeric:tabular-nums; margin-top:2px; }
+
+    /* ---- one message line, one voice ---- */
+    .notice { margin-top:16px; padding:12px 14px; border-radius:var(--r-md); background:var(--soft); border:1px solid var(--line); }
+    .notice.bad { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); background:color-mix(in srgb, var(--bad) 8%, var(--soft)); }
+
+    /* ---- collapsible detail panels: open only what is being looked at ---- */
+    .panel { margin-top:12px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--soft); overflow:hidden; }
+    .panel > summary { cursor:pointer; padding:11px 14px; font-weight:650; list-style:none; display:flex; align-items:center; gap:8px; user-select:none; }
+    .panel > summary::-webkit-details-marker { display:none; }
+    .panel > summary::before { content:""; width:6px; height:6px; border-right:1.6px solid var(--muted); border-bottom:1.6px solid var(--muted); transform:rotate(-45deg); transition:transform var(--fast) var(--ease); flex:none; margin-left:2px; }
+    .panel[open] > summary::before { transform:rotate(45deg); }
+    .panel > summary:hover { background:color-mix(in srgb, var(--accent) 5%, transparent); }
+    .panel > .panel-body { padding:0 14px 14px; }
+
+    /* ---- actions: one primary, up to two secondary, the rest behind "more" ---- */
+    #actionBar { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin-top:18px; }
+    button, .button {
+      appearance:none; display:inline-flex; align-items:center; justify-content:center; gap:6px;
+      padding:9px 15px; border:1px solid var(--line-strong); border-radius:var(--r-sm);
+      color:var(--text); background:var(--card); cursor:pointer; font:inherit; font-weight:650;
+      text-decoration:none; white-space:nowrap;
+      transition:background var(--fast) var(--ease), border-color var(--fast) var(--ease), transform var(--fast) var(--ease), box-shadow var(--fast) var(--ease);
+    }
+    button:hover, .button:hover { background:var(--soft); border-color:var(--muted); }
+    button:active, .button:active { transform:translateY(1px); }
+    button:focus-visible, .button:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+    button.primary { color:var(--accent-ink); background:var(--accent); border-color:var(--accent); box-shadow:0 1px 2px color-mix(in srgb, var(--accent) 40%, transparent); }
+    button.primary:hover { background:color-mix(in srgb, var(--accent) 88%, #000); border-color:color-mix(in srgb, var(--accent) 88%, #000); }
+    button.danger { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 35%, var(--line-strong)); }
+    button.danger:hover { background:color-mix(in srgb, var(--bad) 8%, var(--card)); }
+    button:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+
+    .overflow { position:relative; display:inline-flex; }
+    .overflow-menu { position:absolute; right:0; top:calc(100% + 6px); z-index:30; display:grid; gap:4px; min-width:220px; padding:6px; background:var(--card); border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-pop); animation:wk-pop var(--fast) var(--ease); }
+    .overflow-menu button { justify-content:flex-start; border:0; background:transparent; font-weight:600; padding:9px 11px; }
+    .overflow-menu button:hover { background:var(--soft); }
+    @keyframes wk-pop { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+
+    /* ---- capture speed controls stay near the gap list they affect ---- */
+    .speed { display:inline-flex; align-items:center; gap:7px; padding:0 11px; border:1px solid var(--line-strong); border-radius:var(--r-sm); background:var(--card); font-weight:650; }
     .speed select { appearance:none; border:0; background:transparent; color:var(--text); font:inherit; font-weight:650; padding:9px 0; cursor:pointer; }
     .speed input[type="number"] { width:4.2em; border:1px solid var(--line); border-radius:6px; background:var(--soft); color:var(--text); font:inherit; font-weight:650; padding:4px 6px; }
-    button, .button { appearance:none; display:inline-flex; align-items:center; justify-content:center; padding:9px 13px; border:1px solid var(--line); border-radius:9px; color:var(--text); background:var(--card); cursor:pointer; font:inherit; font-weight:650; text-decoration:none; }
-    button.primary { color:white; background:var(--blue); border-color:var(--blue); }
-    button.danger { color:var(--red); }
-    button:disabled { opacity:.55; cursor:not-allowed; }
-    .notice { margin-top:14px; padding:11px 13px; border-radius:9px; background:var(--soft); border:1px solid var(--line); }
-    .notice.bad { color:var(--red); border-color:color-mix(in srgb, var(--red) 55%, var(--line)); background:color-mix(in srgb, var(--red) 10%, var(--soft)); font-weight:650; }
-    .range.active { border-color:var(--blue); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--blue) 35%, transparent); }
-    .log { max-height:240px; overflow:auto; background:#0b1220; color:#cbd5e1; border-radius:9px; padding:11px; font:12px/1.55 Consolas,monospace; white-space:pre-wrap; }
-    details summary { cursor:pointer; font-weight:700; } details .muted { margin:6px 0 10px; }
-    nav { display:flex; align-items:center; gap:8px; }
+
+    /* ---- lists ---- */
+    .actions { display:flex; flex-wrap:wrap; gap:9px; }
+    .activity-list { display:grid; gap:4px; max-height:230px; overflow:auto; margin-top:8px; }
+    .activity { display:grid; grid-template-columns:78px 82px 84px 1fr; gap:10px; padding:6px 9px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--card); font-size:13px; }
+    .activity.saving { border-color:var(--accent); }
+    .activity.failed { border-color:var(--bad); }
+    .timeline { display:grid; gap:7px; }
+    .range { display:flex; justify-content:space-between; gap:12px; padding:9px 11px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--card); }
+    .range.active { border-color:var(--accent); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+    @keyframes wk-breathe { 0%,100% { background:var(--card); } 50% { background:color-mix(in srgb, var(--accent) 14%, var(--card)); } }
+    .range.live { border-color:var(--accent); animation:wk-breathe 1.6s var(--ease) infinite; }
+
+    .log { max-height:240px; overflow:auto; background:#0b1220; color:#cbd5e1; border-radius:var(--r-md); padding:12px; font:12px/1.55 Consolas,monospace; white-space:pre-wrap; }
+    details#diagnosticsPanel > summary { cursor:pointer; font-weight:700; }
+    #diagnosticsPanel .muted { margin:6px 0 10px; }
+
     .tasks { display:grid; gap:10px; }
-    .task { min-width:0; padding:13px; border:1px solid var(--line); background:var(--soft); border-radius:10px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
-    .work-card { padding:15px; border:1px solid var(--line); background:var(--soft); border-radius:12px; display:grid; gap:11px; }
+    .task { min-width:0; padding:14px; border:1px solid var(--line); background:var(--soft); border-radius:var(--r-md); display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
+    .task.lost { opacity:.68; border-style:dashed; }
+    .work-card { padding:16px; border:1px solid var(--line); background:var(--soft); border-radius:var(--r-md); display:grid; gap:11px; }
     .work-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
     .chips { display:flex; flex-wrap:wrap; gap:6px; }
-    .chip { padding:3px 8px; border:1px solid var(--line); border-radius:999px; color:var(--muted); background:var(--card); font-size:12px; }
-    .timeline { display:grid; gap:7px; margin-top:12px; }
-    .range { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); }
+    .chip { padding:3px 9px; border:1px solid var(--line); border-radius:999px; color:var(--muted); background:var(--card); font-size:12px; }
+    select { font:inherit; padding:8px 10px; border:1px solid var(--line-strong); border-radius:var(--r-sm); background:var(--card); color:var(--text); }
+
     [hidden] { display:none !important; }
-    @media (max-width:650px) { .hero,.task { grid-template-columns:1fr; } .grid { grid-template-columns:1fr; } }
+    @media (max-width:650px) { .hero,.task { grid-template-columns:1fr; } #stats { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    /* Motion is decoration here; honour the system preference and drop all of it. */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration:0s !important; animation-iteration-count:1 !important; transition-duration:0s !important; }
+      .range.live { background:color-mix(in srgb, var(--accent) 12%, var(--card)); }
+    }
   </style>
 </head>
 <body>
@@ -58,48 +149,65 @@
         <div><div id="title" class="title" data-i18n="downloadTask">视频下载</div><div id="subtitle" class="muted"></div></div>
         <span id="status" class="pill" data-i18n="statusChecking">正在检查</span>
       </div>
-      <progress id="progress" value="0" max="1"></progress>
-      <div id="progressText" class="muted" data-i18n="downloadProgress">下载进度</div>
-      <div class="grid">
+
+      <div id="progressWrap">
+        <progress id="progress" value="0" max="1"></progress>
+        <canvas id="coverage" height="24" hidden></canvas>
+        <div id="coverageLegend" class="muted" hidden data-i18n="coverageLegend">蓝色为已保存，灰色为缺口；整条对应完整时长。</div>
+        <div id="progressText" class="muted" data-i18n="downloadProgress">下载进度</div>
+      </div>
+
+      <div id="stats">
         <div class="stat"><span class="muted" data-i18n="completedItems">已完成</span><strong id="saved">0</strong></div>
         <div class="stat"><span class="muted" data-i18n="remainingItems">待补内容</span><strong id="missing">—</strong></div>
         <div class="stat"><span class="muted" data-i18n="savedSize">已保存</span><strong id="bytes">0 MB</strong></div>
         <div class="stat"><span class="muted" data-i18n="downloadSpeed">下载速度</span><strong id="speed">—</strong></div>
       </div>
+
       <div id="notice" class="notice" data-i18n="chooseFolderIntro">请选择或新建一个专用子文件夹，例如 Downloads\Web Keeper。浏览器不允许直接授权系统文件夹根目录。</div>
-      <div id="locationPanel" class="notice" hidden><strong data-i18n="saveLocation">保存位置</strong><div id="locationText" class="muted"></div></div>
-      <section id="missingPanel" class="timeline" hidden><strong data-i18n="missingTimeline">需要补全的位置</strong><div id="missingRanges"></div></section>
-      <div class="actions">
-        <button id="choose" class="primary" data-i18n="chooseFolderAndStart">选择位置并开始</button>
-        <button id="resume" hidden data-i18n="continueDownload">继续</button>
-        <button id="backToVideo" hidden data-i18n="returnToVideo">返回网页继续播放</button>
-        <button id="switchAssisted" hidden data-i18n="switchToAssisted">改用网页辅助</button>
-        <button id="smartFill" hidden data-i18n="smartFill">智能补全缺失位置</button>
-        <label id="captureSpeedPanel" class="speed" hidden><span data-i18n="captureSpeed">播放加速</span>
-          <select id="captureSpeed">
-            <option value="1" data-i18n="captureSpeedNormal">正常速度</option>
-            <option value="2">2x</option>
-            <option value="4">4x</option>
-            <option value="8">8x</option>
-            <option value="seek10" data-i18n="captureSeekBoost">自动快进</option>
-          </select>
-        </label>
-        <label id="seekBoostPanel" class="speed" hidden>
-          <span data-i18n="captureSeekEvery">每</span>
-          <input id="seekBoostInterval" type="number" min="0.25" max="30" step="0.25" value="1" title="seconds">
-          <span data-i18n="captureSeekSeconds">秒</span>
-          <span data-i18n="captureSeekJump">快进</span>
-          <input id="seekBoostStep" type="number" min="1" max="120" step="1" value="10" title="seconds">
-          <span data-i18n="captureSeekSeconds">秒</span>
-        </label>
-        <button id="merge" hidden data-i18n="checkAndCreateVideo">检查并生成视频</button>
-        <button id="openOutput" hidden data-i18n="openGeneratedVideo">打开生成的视频</button>
-        <button id="subtitles" hidden data-i18n="saveSubtitles">保存字幕</button>
-        <button id="pause" hidden data-i18n="pauseDownload">暂停</button>
-        <button id="deleteSegments" class="danger" hidden data-i18n="cleanTemporaryFiles">清理临时下载文件</button>
-        <button id="deleteOutput" class="danger" hidden data-i18n="deleteOutput">删除生成的视频</button>
-        <button id="removeTask" class="danger" hidden data-i18n="removeTask">从列表移除</button>
-      </div>
+
+      <div id="actionBar"></div>
+
+      <details id="missingPanel" class="panel" hidden open>
+        <summary data-i18n="missingTimeline">需要补全的位置</summary>
+        <div class="panel-body">
+          <div id="captureTools" class="actions" style="margin-bottom:10px">
+            <label id="captureSpeedPanel" class="speed" hidden><span data-i18n="captureSpeed">播放加速</span>
+              <select id="captureSpeed">
+                <option value="1" data-i18n="captureSpeedNormal">正常速度</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+                <option value="8">8x</option>
+                <option value="seek10" data-i18n="captureSeekBoost">自动快进</option>
+              </select>
+            </label>
+            <label id="seekBoostPanel" class="speed" hidden>
+              <span data-i18n="captureSeekEvery">每</span>
+              <input id="seekBoostInterval" type="number" min="0.25" max="30" step="0.25" value="1" title="seconds">
+              <span data-i18n="captureSeekSeconds">秒</span>
+              <span data-i18n="captureSeekJump">快进</span>
+              <input id="seekBoostStep" type="number" min="1" max="120" step="1" value="10" title="seconds">
+              <span data-i18n="captureSeekSeconds">秒</span>
+            </label>
+          </div>
+          <div id="missingRanges" class="timeline"></div>
+        </div>
+      </details>
+
+      <details id="activityPanel" class="panel" hidden>
+        <summary data-i18n="activityTitle">实时分片流水</summary>
+        <div class="panel-body"><div id="activityList" class="activity-list"></div></div>
+      </details>
+
+      <details id="sourcePanel" class="panel" hidden>
+        <summary data-i18n="connectionTitle">网页连接与分片来源</summary>
+        <div class="panel-body"><div id="sourceText" class="muted"></div></div>
+      </details>
+
+      <details id="locationPanel" class="panel" hidden>
+        <summary data-i18n="outputLocation">成品保存位置</summary>
+        <div class="panel-body"><div id="locationText" class="muted"></div></div>
+      </details>
     </section>
 
     <section id="listView" class="card" hidden>

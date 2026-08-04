@@ -2,6 +2,7 @@ const SCRIPT_VERSION = "web-keeper-extension-0.4.6";
 const CANDIDATES_KEY = "wkCandidates";
 const JOBS_KEY = "wkJobs";
 const MEDIA_EVENTS_KEY = "wkMediaEvents";
+const API_ACTIVITY_KEY = "wkApiActivity";
 const MAX_CANDIDATES = 120;
 const MAX_PENDING_REQUESTS = 500;
 const MAX_MEDIA_EVENTS = 600;
@@ -9,6 +10,112 @@ const MEDIA_EVENT_TTL_MS = 30 * 60 * 1000;
 let candidateWriteChain = Promise.resolve();
 const pendingMediaHeaders = new Map();
 const recentStreamTabs = new Map();
+const expandedPlaylists = new Set();
+const apiActivity = new Map();
+let apiActivityFlushedAt = 0;
+
+// Records which endpoints a page talks to, without their bodies. Enough to spot "the subtitle
+// really comes from this other method", not enough to leak a session.
+function noteApiActivity(details, responseHeaders) {
+  try {
+    const url = new URL(details.url);
+    if (!/\/(?:gapi|api|rpc)\//i.test(url.pathname)) return;
+    const key = `${details.tabId}|${details.method} ${url.pathname}`;
+    const entry = apiActivity.get(key) || { tabId: details.tabId, label: `${details.method} ${url.pathname}`, count: 0 };
+    entry.count += 1;
+    entry.contentType = responseHeaders?.["content-type"] || entry.contentType || "";
+    entry.bytes = Number(responseHeaders?.["content-length"] || 0) || entry.bytes || 0;
+    entry.lastSeen = Date.now();
+    apiActivity.set(key, entry);
+    while (apiActivity.size > 200) apiActivity.delete(apiActivity.keys().next().value);
+    if (Date.now() - apiActivityFlushedAt < 2000) return;
+    apiActivityFlushedAt = Date.now();
+    void chrome.storage.local.set({ [API_ACTIVITY_KEY]: [...apiActivity.values()].slice(-200) });
+  } catch { /* not a URL we can classify */ }
+}
+
+// The quality list is built from URLs the browser actually requested, so a rendition the player
+// never switched to simply does not exist as far as the popup is concerned — a player offering
+// 1080p/720p/404p shows up as "1 quality". The master playlist lists them all, so read it.
+function masterPlaylistVariants(text, baseUrl) {
+  const lines = String(text || "").split(/\r?\n/);
+  const variants = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/^#EXT-X-STREAM-INF:/i.test(lines[index])) continue;
+    const attributes = lines[index];
+    const resolution = /RESOLUTION=(\d+x\d+)/i.exec(attributes)?.[1] || "";
+    const bandwidth = Number(/BANDWIDTH=(\d+)/i.exec(attributes)?.[1] || 0);
+    let uri = "";
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const line = lines[next].trim();
+      if (!line) continue;
+      if (line.startsWith("#")) break;
+      uri = line;
+      break;
+    }
+    if (!uri) continue;
+    try { variants.push({ url: new URL(uri, baseUrl).href, resolution: resolution || "auto", bandwidth }); }
+    catch { /* unresolvable variant */ }
+  }
+  return variants;
+}
+
+async function expandMasterPlaylist(observed, context) {
+  if (expandedPlaylists.has(observed.url)) return;
+  expandedPlaylists.add(observed.url);
+  while (expandedPlaylists.size > 80) expandedPlaylists.delete(expandedPlaylists.values().next().value);
+  let body = "";
+  try {
+    const response = await fetch(observed.url, { credentials: "include", cache: "no-store" });
+    if (!response.ok) return;
+    body = await response.text();
+  } catch { return; }
+  const variants = masterPlaylistVariants(body, observed.url);
+  if (variants.length < 2) return;
+  candidateWriteChain = candidateWriteChain.then(async () => {
+    const stored = await chrome.storage.local.get({ [CANDIDATES_KEY]: [] });
+    const candidates = Array.isArray(stored[CANDIDATES_KEY]) ? stored[CANDIDATES_KEY] : [];
+    const now = Date.now();
+    let added = 0;
+    for (const variant of variants) {
+      const identity = parseIdentity(variant.url, observed.tabId, context.pageUrl);
+      // RESOLUTION in the master is the real encoded size; the URL label is a marketing name and
+      // lies about it (a "720p" path carrying 720x404). Prefer the manifest, fall back to the URL.
+      const resolution = variant.resolution && variant.resolution !== "auto" ? variant.resolution : identity.resolution;
+      const id = `${observed.tabId}:${identity.product}:${resolution}`;
+      if (candidates.some((item) => item.id === id)) continue;
+      candidates.push({
+        id,
+        product: identity.product,
+        resolution,
+        kind: "playlist",
+        url: variant.url,
+        tabId: observed.tabId,
+        pageUrl: context.pageUrl,
+        pageTitle: context.pageTitle,
+        playlistUrl: variant.url,
+        playlistUrls: [variant.url, observed.url],
+        manifestUrl: "",
+        manifestUrls: [],
+        directUrl: "",
+        directFiles: [],
+        segmentUrl: "",
+        keyUrl: "",
+        subtitles: [],
+        // The master was fetched with the page's own session; reuse the headers we already saw.
+        headers: { ...(observed.headers || {}) },
+        fromMasterPlaylist: true,
+        decision: "pending",
+        firstSeen: now,
+        lastSeen: now,
+        seen: 1
+      });
+      added += 1;
+    }
+    if (!added) return;
+    await chrome.storage.local.set({ [CANDIDATES_KEY]: candidates.slice(-MAX_CANDIDATES) });
+  });
+}
 
 function mediaKind(url, requestType = "") {
   try {
@@ -27,8 +134,11 @@ function mediaKind(url, requestType = "") {
   return "";
 }
 
-function isKnownSubtitleUrl(url) {
-  try { return /\.(?:vtt|srt|ttml|dfxp|ass|ssa)(?:[?#]|$)/i.test(new URL(url).href); }
+function isKnownSubtitleUrl(url, confirmed = null) {
+  // A subtitle served from an API path has no extension, so a URL the response already proved
+  // to be a subtitle must survive this filter too.
+  if (confirmed && confirmed[String(url)]) return true;
+  try { return /\.(?:vtt|srt|ttml|dfxp|ass|ssa|m3u8)(?:[?#]|$)/i.test(new URL(url).href); }
   catch { return false; }
 }
 
@@ -181,6 +291,21 @@ async function recordCandidate(details, forcedKind = "") {
       const related = candidates.filter((item) => item.tabId === details.tabId && now - item.lastSeen < 10 * 60 * 1000);
       for (const item of related) {
         item.subtitles = Array.from(new Set([...(item.subtitles || []), details.url])).slice(-20);
+        // Remember that this URL was proven to be a subtitle by its response type.
+        item.subtitleTypes = { ...(item.subtitleTypes || {}), [details.url]: observed.contentType || "text/vtt" };
+        const call = pendingSubtitleRequests.get(details.requestId);
+        if (call) {
+          // Keep the subtitle request's own headers: the membership token that decides whether the
+          // server answers with the whole track or a five-minute preview is in there, and so is
+          // the JWT the payload is encrypted against.
+          const entry = { url: details.url, method: call.method, body: call.body, headers: { ...(observed.headers || {}) }, contentType: observed.headers?.["content-type"] || "application/grpc-web+proto" };
+          // The player calls the same endpoint once per subtitle chunk, so every distinct body
+          // is a different part of the track and all of them are needed.
+          const calls = (item.subtitleCalls || []).filter((existing) => existing.body !== entry.body);
+          calls.push(entry);
+          item.subtitleCalls = calls.slice(-200);
+          item.subtitleRequests = { ...(item.subtitleRequests || {}), [details.url]: entry };
+        }
         item.lastSeen = now;
       }
       await chrome.storage.local.set({ [CANDIDATES_KEY]: candidates });
@@ -217,7 +342,7 @@ async function recordCandidate(details, forcedKind = "") {
       candidate.decision = "pending";
       delete candidate.ignoredUntil;
     }
-    candidate.subtitles = Array.from(new Set((candidate.subtitles || []).filter(isKnownSubtitleUrl)));
+    candidate.subtitles = Array.from(new Set((candidate.subtitles || []).filter((item) => isKnownSubtitleUrl(item, candidate.subtitleTypes))));
     candidate.lastSeen = now;
     candidate.seen = Number(candidate.seen || 0) + 1;
     candidate.pageUrl = context.pageUrl || candidate.pageUrl;
@@ -227,6 +352,7 @@ async function recordCandidate(details, forcedKind = "") {
     if (kind === "playlist") {
       candidate.playlistUrls = Array.from(new Set([...(candidate.playlistUrls || []), candidate.playlistUrl, details.url].filter(Boolean))).slice(-20);
       candidate.playlistUrl ||= details.url;
+      if (!candidate.fromMasterPlaylist) void expandMasterPlaylist(observed, context);
     }
     if (kind === "manifest") {
       candidate.manifestUrls = Array.from(new Set([...(candidate.manifestUrls || []), candidate.manifestUrl, details.url].filter(Boolean))).slice(-10);
@@ -282,7 +408,7 @@ async function sanitizeStoredCandidates() {
   const candidates = Array.isArray(stored[CANDIDATES_KEY]) ? stored[CANDIDATES_KEY] : [];
   let changed = false;
   for (const item of candidates) {
-    const subtitles = Array.from(new Set((item.subtitles || []).filter(isKnownSubtitleUrl)));
+    const subtitles = Array.from(new Set((item.subtitles || []).filter((url) => isKnownSubtitleUrl(url, item.subtitleTypes))));
     if (subtitles.length !== (item.subtitles || []).length) changed = true;
     item.subtitles = subtitles;
     item.playlistUrls = Array.from(new Set([...(item.playlistUrls || []), item.playlistUrl].filter(Boolean)));
@@ -292,6 +418,32 @@ async function sanitizeStoredCandidates() {
 }
 
 void sanitizeStoredCandidates().catch((error) => console.warn("Web Keeper candidate cleanup failed", error));
+
+const pendingSubtitleRequests = new Map();
+
+function bytesToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+  return btoa(binary);
+}
+
+// A gRPC-style subtitle endpoint only answers POST with its own protobuf body, so the call has
+// to be recorded before it can ever be replayed.
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    try {
+      if (details.method !== "POST" || !/subtitle/i.test(new URL(details.url).pathname)) return;
+      const raw = details.requestBody?.raw?.[0]?.bytes;
+      if (!raw) return;
+      pendingSubtitleRequests.set(details.requestId, { url: details.url, method: details.method, body: bytesToBase64(raw) });
+      while (pendingSubtitleRequests.size > 50) pendingSubtitleRequests.delete(pendingSubtitleRequests.keys().next().value);
+      setTimeout(() => pendingSubtitleRequests.delete(details.requestId), 120000);
+    } catch { /* body not readable */ }
+  },
+  { urls: ["<all_urls>"] },
+  ["requestBody"]
+);
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
@@ -315,6 +467,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 async function recordResponseCandidate(details) {
+  noteApiActivity(details, responseHeaderObject(details));
   const contentType = ((details.responseHeaders || []).find((item) => String(item.name).toLowerCase() === "content-type")?.value || "").toLowerCase();
   const contentDisposition = (details.responseHeaders || []).find((item) => String(item.name).toLowerCase() === "content-disposition")?.value || "";
   const pending = pendingMediaHeaders.get(details.requestId) || {};
@@ -323,6 +476,11 @@ async function recordResponseCandidate(details) {
   if (/mpegurl/i.test(contentType)) return recordCandidate(enriched, "playlist");
   if (/dash\+xml/i.test(contentType)) return recordCandidate(enriched, "manifest");
   if (/^(?:text\/vtt|application\/(?:ttml\+xml|x-subrip)|text\/srt)/i.test(contentType)) return recordCandidate(enriched, "subtitle");
+  // Some sites serve subtitles from an API with a protobuf/octet-stream content type; the path
+  // is the only honest hint, so accept it and let the task page work out the payload.
+  if (/subtitle/i.test(new URL(details.url).pathname) && ["xmlhttprequest", "other"].includes(details.type)) {
+    return recordCandidate(enriched, "subtitle");
+  }
   if (!["media", "xmlhttprequest", "other"].includes(details.type)) return;
 
   const obviousSegment = /\.(?:ts|m4s|cmfv|cmfa|aac)(?:[?#]|$)/i.test(details.url);
@@ -375,6 +533,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return selected;
     });
     candidateWriteChain.then((candidate) => sendResponse({ ok: true, candidate })).catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message?.type === "remove-candidates") {
+    const wanted = new Set((message.candidateIds || []).map(String));
+    candidateWriteChain = candidateWriteChain.then(async () => {
+      const stored = await chrome.storage.local.get({ [CANDIDATES_KEY]: [] });
+      const candidates = stored[CANDIDATES_KEY] || [];
+      const kept = candidates.filter((item) => !wanted.has(String(item.id)));
+      // Only the discovery record goes away; tasks, checkpoints and finished files are untouched.
+      await chrome.storage.local.set({ [CANDIDATES_KEY]: kept });
+      return candidates.length - kept.length;
+    });
+    candidateWriteChain.then((removed) => sendResponse({ ok: true, removed })).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message?.type === "get-extension-state") {

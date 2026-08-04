@@ -435,6 +435,48 @@
     return output;
   }
 
+  // ISO/IEC 14496-12 sidx. One reference per fragment: its byte size and its duration, so a
+  // player can map a timestamp to a file offset without reading anything in between.
+  function buildSidx(references, { timescale = 90000, referenceId = 1, earliestPresentationTime = 0 } = {}) {
+    const count = references.length;
+    const bytes = new Uint8Array(sidxByteLength(count));
+    const view = new DataView(bytes.buffer);
+    view.setUint32(0, bytes.length);
+    bytes.set([0x73, 0x69, 0x64, 0x78], 4);           // "sidx"
+    view.setUint8(8, 1);                               // version 1: 64-bit times
+    view.setUint32(12, referenceId);
+    view.setUint32(16, timescale);
+    view.setBigUint64(20, BigInt(Math.max(0, Math.round(earliestPresentationTime))));
+    view.setBigUint64(28, 0n);                         // first_offset: fragments follow immediately
+    view.setUint16(36, 0);                             // reserved
+    view.setUint16(38, count);
+    references.forEach((reference, index) => {
+      const at = 40 + index * 12;
+      // reference_type 0 (media), then the referenced byte size.
+      view.setUint32(at, Math.max(0, Math.round(reference.size)) & 0x7fffffff);
+      view.setUint32(at + 4, Math.max(0, Math.round(reference.duration)));
+      // starts_with_SAP = 1, SAP_type = 1: every fragment begins at a keyframe.
+      view.setUint32(at + 8, 0x90000000);
+    });
+    return bytes;
+  }
+
+  // A placeholder of the same size, so the real index can be written in place once the fragment
+  // sizes are known. "free" is skipped by every parser.
+  function buildFreeBox(length) {
+    const bytes = new Uint8Array(Math.max(8, length));
+    const view = new DataView(bytes.buffer);
+    view.setUint32(0, bytes.length);
+    bytes.set([0x66, 0x72, 0x65, 0x65], 4);            // "free"
+    return bytes;
+  }
+
+  function sidxByteLength(referenceCount) {
+    // 8 box header + 4 version/flags + 4 reference_ID + 4 timescale + 8 earliest_presentation_time
+    // + 8 first_offset + 2 reserved + 2 reference_count, then 12 bytes per reference.
+    return 40 + referenceCount * 12;
+  }
+
   function patchMp4InitDuration(input, durationSeconds) {
     const output = (input instanceof Uint8Array ? input : new Uint8Array(input)).slice();
     const seconds = Number(durationSeconds || 0);
@@ -708,6 +750,744 @@
     }
     return { tracks, find, track };
   }
+
+  function readVarint(bytes, position) {
+    let result = 0;
+    let shift = 0;
+    let cursor = position;
+    while (cursor < bytes.length) {
+      const byte = bytes[cursor];
+      cursor += 1;
+      result += (byte & 0x7f) * Math.pow(2, shift);
+      if ((byte & 0x80) === 0) break;
+      shift += 7;
+    }
+    return [result, cursor];
+  }
+
+  // Minimal protobuf reader: the payload only needs one length-delimited string field.
+  // protobuf fields can repeat, and a single reply often carries one ciphertext chunk per entry.
+  function protobufStringFields(input, fieldNumber) {
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+    const values = [];
+    let position = 0;
+    while (position < bytes.length) {
+      const [key, afterKey] = readVarint(bytes, position);
+      position = afterKey;
+      const wireType = key & 0x07;
+      const number = Math.floor(key / 8);
+      if (wireType === 0) position = readVarint(bytes, position)[1];
+      else if (wireType === 1) position += 8;
+      else if (wireType === 2) {
+        const [length, afterLength] = readVarint(bytes, position);
+        position = afterLength;
+        if (number === fieldNumber) values.push(new TextDecoder().decode(bytes.subarray(position, position + length)));
+        position += length;
+      } else if (wireType === 5) position += 4;
+      else return values;
+    }
+    return values;
+  }
+
+  function protobufStringField(input, fieldNumber) {
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+    let position = 0;
+    while (position < bytes.length) {
+      const [key, afterKey] = readVarint(bytes, position);
+      position = afterKey;
+      const wireType = key & 0x07;
+      const number = Math.floor(key / 8);
+      if (wireType === 0) { position = readVarint(bytes, position)[1]; }
+      else if (wireType === 1) { position += 8; }
+      else if (wireType === 2) {
+        const [length, afterLength] = readVarint(bytes, position);
+        position = afterLength;
+        const value = bytes.subarray(position, position + length);
+        position += length;
+        if (number === fieldNumber) return new TextDecoder().decode(value);
+      } else if (wireType === 5) { position += 4; }
+      else return null;
+    }
+    return null;
+  }
+
+  function jwtPayload(token) {
+    const parts = String(token || "").split(".");
+    if (parts.length < 2) return {};
+    try {
+      const base = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      return JSON.parse(decodeURIComponent(escape(atob(base + "=".repeat((4 - base.length % 4) % 4)))));
+    } catch { return {}; }
+  }
+
+  // The subtitle IV is the viewer's own numeric id, taken from the JWT the page already sends.
+  function subtitleUserIdFromHeaders(headers = {}) {
+    const tokens = [];
+    for (const [name, value] of Object.entries(headers)) {
+      const lower = String(name).toLowerCase();
+      if (lower === "authorization" && value) tokens.push(String(value).replace(/^Bearer\s+/i, ""));
+      if (lower === "cookie" && value) {
+        for (const part of String(value).split(";")) {
+          const [cookieName, cookieValue] = part.split("=").map((item) => (item || "").trim());
+          if (["authorization", "token", "access_token"].includes(String(cookieName).toLowerCase()) && cookieValue) {
+            tokens.push(cookieValue.replace(/^Bearer\s+/i, ""));
+          }
+        }
+      }
+    }
+    for (const token of tokens) {
+      const payload = jwtPayload(token);
+      for (const field of ["uid", "Identity", "identity", "id", "user_id"]) {
+        const value = payload?.[field];
+        if (value != null && String(value).trim()) return String(value).trim();
+      }
+    }
+    return null;
+  }
+
+  const SUBTITLE_MODES = ["none", "zh-hans", "zh-hant", "en-us", "en-gb"];
+  const ZH_T2S_PHRASES = {"影片": "影片", "繁體": "繁体", "繁體中文": "简体中文", "臺灣": "台湾", "軟體": "软件", "香港": "香港"};
+  const ZH_S2T_PHRASES = {"台湾": "臺灣", "影片": "影片", "简体中文": "繁體中文", "繁体": "繁體", "软件": "軟體", "香港": "香港"};
+  const ZH_T2S_CHARS = {"來": "来", "個": "个", "們": "们", "傳": "传", "出": "出", "吧": "吧", "呢": "呢", "問": "问", "嗎": "吗", "器": "器", "國": "国", "妳": "你", "學": "学", "實": "实", "對": "对", "常": "常", "後": "后", "從": "从", "愛": "爱", "態": "态", "應": "应", "換": "换", "擇": "择", "於": "于", "時": "时", "書": "书", "會": "会", "樂": "乐", "標": "标", "檔": "档", "權": "权", "氣": "气", "沒": "没", "瀏": "浏", "為": "为", "現": "现", "理": "理", "畫": "画", "異": "异", "發": "发", "示": "示", "簡": "简", "給": "给", "網": "网", "線": "线", "習": "习", "聲": "声", "聽": "听", "腦": "脑", "與": "与", "處": "处", "號": "号", "裏": "里", "裡": "里", "見": "见", "覽": "览", "訊": "讯", "話": "话", "該": "该", "認": "认", "誤": "误", "說": "说", "請": "请", "證": "证", "讓": "让", "質": "质", "載": "载", "轉": "转", "這": "这", "進": "进", "過": "过", "選": "选", "還": "还", "那": "那", "錯": "错", "長": "长", "門": "门", "開": "开", "間": "间", "關": "关", "雲": "云", "電": "电", "音": "音", "頁": "页", "頭": "头", "題": "题", "顯": "显", "體": "体", "麼": "么", "點": "点"};
+  const ZH_S2T_CHARS = {"与": "與", "个": "個", "为": "為", "么": "麼", "乐": "樂", "习": "習", "书": "書", "于": "於", "云": "雲", "从": "從", "们": "們", "会": "會", "传": "傳", "体": "體", "你": "你", "关": "關", "发": "發", "号": "號", "后": "後", "吗": "嗎", "听": "聽", "国": "國", "声": "聲", "处": "處", "头": "頭", "学": "學", "实": "實", "对": "對", "应": "應", "开": "開", "异": "異", "态": "態", "择": "擇", "换": "換", "时": "時", "显": "顯", "权": "權", "来": "來", "标": "標", "档": "檔", "气": "氣", "没": "沒", "浏": "瀏", "点": "點", "爱": "愛", "现": "現", "电": "電", "画": "畫", "简": "簡", "线": "線", "给": "給", "网": "網", "脑": "腦", "见": "見", "览": "覽", "认": "認", "让": "讓", "讯": "訊", "证": "證", "话": "話", "该": "該", "误": "誤", "说": "說", "请": "請", "质": "質", "转": "轉", "载": "載", "过": "過", "还": "還", "这": "這", "进": "進", "选": "選", "里": "裡", "错": "錯", "长": "長", "门": "門", "问": "問", "间": "間", "页": "頁", "题": "題"};
+  const EN_GB_TO_US = {"analyse": "analyze", "analysed": "analyzed", "analysing": "analyzing", "behaviour": "behavior", "behaviours": "behaviors", "cancelled": "canceled", "cancelling": "canceling", "centre": "center", "centres": "centers", "colour": "color", "colours": "colors", "defence": "defense", "favour": "favor", "favourite": "favorite", "favourites": "favorites", "favours": "favors", "grey": "gray", "honour": "honor", "honours": "honors", "licence": "license", "litre": "liter", "litres": "liters", "metre": "meter", "metres": "meters", "organise": "organize", "organised": "organized", "organising": "organizing", "programme": "program", "realise": "realize", "realised": "realized", "realising": "realizing", "recognise": "recognize", "recognised": "recognized", "recognising": "recognizing", "theatre": "theater", "theatres": "theaters", "travelled": "traveled", "travelling": "traveling"};
+  const EN_US_TO_GB = {"analyze": "analyse", "analyzed": "analysed", "analyzing": "analysing", "behavior": "behaviour", "behaviors": "behaviours", "canceled": "cancelled", "canceling": "cancelling", "center": "centre", "centers": "centres", "color": "colour", "colors": "colours", "defense": "defence", "favor": "favour", "favorite": "favourite", "favorites": "favourites", "favors": "favours", "gray": "grey", "honor": "honour", "honors": "honours", "license": "licence", "liter": "litre", "liters": "litres", "meter": "metre", "meters": "metres", "organize": "organise", "organized": "organised", "organizing": "organising", "program": "programme", "realize": "realise", "realized": "realised", "realizing": "realising", "recognize": "recognise", "recognized": "recognised", "recognizing": "recognising", "theater": "theatre", "theaters": "theatres", "traveled": "travelled", "traveling": "travelling"};
+
+  function replacePhrases(text, phrases) {
+    let result = String(text);
+    for (const [from, to] of Object.entries(phrases)) result = result.split(from).join(to);
+    return result;
+  }
+
+  function translateChars(text, table) {
+    let result = "";
+    for (const character of String(text)) result += table[character] ?? character;
+    return result;
+  }
+
+  // Preserve the original capitalisation so "Colour" does not become "color" mid-sentence.
+  function convertEnglishSpelling(text, mapping) {
+    return String(text).replace(/[A-Za-z]+/g, (word) => {
+      const replacement = mapping[word.toLowerCase()];
+      if (!replacement) return word;
+      if (word === word.toUpperCase()) return replacement.toUpperCase();
+      if (word[0] === word[0].toUpperCase()) return replacement[0].toUpperCase() + replacement.slice(1);
+      return replacement;
+    });
+  }
+
+  // Counts CJK characters the hand-written tables could not map, so callers can warn honestly.
+  function unconvertedChineseCount(text, mode) {
+    if (!["zh-hans", "zh-hant"].includes(mode)) return 0;
+    const table = mode === "zh-hans" ? ZH_T2S_CHARS : ZH_S2T_CHARS;
+    const reverse = mode === "zh-hans" ? ZH_S2T_CHARS : ZH_T2S_CHARS;
+    let unmapped = 0;
+    for (const character of String(text)) {
+      if (!/[\u4e00-\u9fff]/.test(character)) continue;
+      // Already in the target form when it appears as a value of the opposite table.
+      if (table[character] || Object.prototype.hasOwnProperty.call(reverse, character)) continue;
+      unmapped += 1;
+    }
+    return unmapped;
+  }
+
+  function convertSubtitleText(text, mode = "none") {
+    if (!SUBTITLE_MODES.includes(mode) || mode === "none") return String(text);
+    if (mode === "zh-hans") return translateChars(replacePhrases(text, ZH_T2S_PHRASES), ZH_T2S_CHARS);
+    if (mode === "zh-hant") return translateChars(replacePhrases(text, ZH_S2T_PHRASES), ZH_S2T_CHARS);
+    if (mode === "en-us") return convertEnglishSpelling(text, EN_GB_TO_US);
+    return convertEnglishSpelling(text, EN_US_TO_GB);
+  }
+
+  function parseVttTimestamp(value) {
+    const parts = String(value).trim().split(":");
+    if (parts.length < 2) return 0;
+    const seconds = Number(parts.pop().replace(",", ".")) || 0;
+    const minutes = Number(parts.pop()) || 0;
+    const hours = Number(parts.pop() || 0) || 0;
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+
+  function formatVttTimestamp(seconds) {
+    const total = Math.max(0, Number(seconds) || 0);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const rest = total % 60;
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${rest.toFixed(3).padStart(6, "0")}`;
+  }
+
+  // Each segmented part times its cues from its own LOCAL anchor; without applying the
+  // MPEGTS offset the merged file drifts further out of sync with every part.
+  function timestampMapOffset(header, baseMpegts) {
+    const local = /LOCAL:\s*([0-9:.]+)/i.exec(header || "");
+    const mpegts = /MPEGTS:\s*(\d+)/i.exec(header || "");
+    if (!local || !mpegts) return null;
+    return { mpegts: Number(mpegts[1]), offset: (Number(mpegts[1]) - baseMpegts) / 90000 - parseVttTimestamp(local[1]) };
+  }
+
+  function shiftVttCues(text, offset) {
+    if (!offset) return text;
+    return String(text).replace(/([0-9:.]+)\s+-->\s+([0-9:.]+)/g, (whole, from, to) =>
+      `${formatVttTimestamp(parseVttTimestamp(from) + offset)} --> ${formatVttTimestamp(parseVttTimestamp(to) + offset)}`);
+  }
+
+  function mergeWebVttParts(parts, mode = "none") {
+    const cues = [];
+    let baseMpegts = null;
+    for (const part of parts) {
+      const lines = String(part).replace(/^\uFEFF/, "").split(/\r?\n/);
+      let index = (lines[0] || "").startsWith("WEBVTT") ? 1 : 0;
+      let offset = 0;
+      while (index < lines.length && (lines[index].startsWith("X-TIMESTAMP-MAP") || lines[index].trim() === "")) {
+        if (lines[index].startsWith("X-TIMESTAMP-MAP")) {
+          const parsed = timestampMapOffset(lines[index], baseMpegts ?? 0);
+          if (parsed) {
+            if (baseMpegts == null) { baseMpegts = parsed.mpegts; offset = 0; }
+            else offset = parsed.offset;
+          }
+        }
+        index += 1;
+      }
+      const body = lines.slice(index).join("\n").trim();
+      if (body) cues.push(shiftVttCues(body, offset));
+    }
+    const merged = `WEBVTT\n\n${cues.join("\n\n")}\n`;
+    return convertSubtitleText(merged, mode);
+  }
+
+  // WebVTT and SubRip differ in the header, the decimal separator, cue settings and numbering.
+  function webVttToSrt(text) {
+    const lines = String(text).replace(/^\uFEFF/, "").split(/\r?\n/);
+    const blocks = [];
+    let current = [];
+    for (const line of lines) {
+      if (line.trim() === "") {
+        if (current.length) blocks.push(current);
+        current = [];
+        continue;
+      }
+      current.push(line);
+    }
+    if (current.length) blocks.push(current);
+
+    const output = [];
+    let index = 0;
+    for (const block of blocks) {
+      const timingLine = block.findIndex((line) => line.includes("-->"));
+      if (timingLine < 0) continue;
+      const header = block[0];
+      if (/^(WEBVTT|NOTE|STYLE|REGION)\b/i.test(header) && timingLine === 0) continue;
+      const timing = block[timingLine].replace(/\s+(align|line|position|size|vertical|region):\S+/gi, "").trim();
+      const match = /([0-9:.,]+)\s*-->\s*([0-9:.,]+)/.exec(timing);
+      if (!match) continue;
+      const toSrtTime = (value) => {
+        const seconds = parseVttTimestamp(value);
+        const whole = Math.floor(seconds);
+        const millis = Math.round((seconds - whole) * 1000);
+        const hours = Math.floor(whole / 3600);
+        const minutes = Math.floor((whole % 3600) / 60);
+        return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")},${String(millis).padStart(3, "0")}`;
+      };
+      const body = block.slice(timingLine + 1)
+        .map((line) => line.replace(/<[^>]+>/g, ""))
+        .filter((line) => line.trim() !== "");
+      if (!body.length) continue;
+      index += 1;
+      output.push(`${index}\n${toSrtTime(match[1])} --> ${toSrtTime(match[2])}\n${body.join("\n")}`);
+    }
+    return `${output.join("\n\n")}\n`;
+  }
+
+  // gRPC-Web puts a 5-byte frame in front of each message: a compression flag and a big-endian
+  // length. Parsing the protobuf from offset zero reads that header as a field and fails.
+  // A gRPC-Web reply may be server-streaming: one HTTP response, many DATA frames. Returning only
+  // the first is how a whole track can look like its opening few minutes.
+  // "=" padding appears wherever one encoded frame ends, so the whole string is not valid base64.
+  // Decode each padded run separately and join the results.
+  function decodeConcatenatedBase64(text) {
+    const clean = String(text || "").replace(/\s+/g, "");
+    if (!clean) return null;
+    const pieces = [];
+    let start = 0;
+    const padding = /=+/g;
+    let match;
+    while ((match = padding.exec(clean))) {
+      pieces.push(clean.slice(start, match.index + match[0].length));
+      start = match.index + match[0].length;
+    }
+    if (start < clean.length) pieces.push(clean.slice(start));
+    const chunks = [];
+    let total = 0;
+    for (const piece of pieces) {
+      if (!piece) continue;
+      let decoded;
+      try { decoded = atob(piece); }
+      catch { return null; }
+      const chunk = new Uint8Array(decoded.length);
+      for (let index = 0; index < decoded.length; index += 1) chunk[index] = decoded.charCodeAt(index);
+      chunks.push(chunk);
+      total += chunk.length;
+    }
+    if (!total) return null;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
+    return out;
+  }
+
+  function grpcWebPayloads(input) {
+    const frames = grpcWebFrames(input);
+    return frames.length ? frames : [input instanceof Uint8Array ? input : new Uint8Array(input || 0)];
+  }
+
+  function grpcWebPayload(input) {
+    return grpcWebPayloads(input)[0];
+  }
+
+  function grpcWebFrames(input) {
+    let bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+    // grpc-web-text delivers the same frames base64 encoded, one encoding per frame, concatenated.
+    const asText = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 64)));
+    if (/^[A-Za-z0-9+/=\s]+$/.test(asText) && bytes.length > 8) {
+      const converted = decodeConcatenatedBase64(new TextDecoder().decode(bytes));
+      if (converted && converted.length > 5 && converted[0] <= 1) bytes = converted;
+    }
+    const frames = [];
+    let position = 0;
+    while (position + 5 <= bytes.length) {
+      const flag = bytes[position];
+      const length = (bytes[position + 1] << 24 >>> 0) + (bytes[position + 2] << 16) + (bytes[position + 3] << 8) + bytes[position + 4];
+      if (flag > 1 || length <= 0 || position + 5 + length > bytes.length) break;
+      // Flag bit 7 marks the trailer frame, which carries status headers rather than a message.
+      if ((flag & 0x80) === 0) frames.push(bytes.subarray(position + 5, position + 5 + length));
+      position += 5 + length;
+    }
+    return frames.length ? frames : [bytes];
+  }
+
+  // Subtitle chunks arrive separately and overlap at the seams, so merge on cue identity.
+
+  function mergeVttDocuments(documents) {
+
+    const seen = new Set();
+
+    const cues = [];
+
+    for (const document of documents) {
+
+      const blocks = String(document || "").replace(/^\uFEFF/, "").split(/\r?\n\s*\r?\n/);
+
+      for (const block of blocks) {
+
+        const body = block.trim();
+
+        if (!body || /^WEBVTT/i.test(body)) continue;
+
+        const timing = /([0-9:.,]+)\s*-->\s*([0-9:.,]+)/.exec(body);
+
+        if (!timing) continue;
+
+        const key = `${parseVttTimestamp(timing[1]).toFixed(3)}|${body.replace(/\s+/g, " ")}`;
+
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+
+        cues.push({ start: parseVttTimestamp(timing[1]), text: body });
+
+      }
+
+    }
+
+    cues.sort((a, b) => a.start - b.start);
+
+    return `WEBVTT\n\n${cues.map((cue) => cue.text).join("\n\n")}\n`;
+
+  }
+
+
+
+  // The last cue end tells how much of the video a subtitle really covers, which is the only
+
+  // way to notice that a chunked track stopped where playback stopped.
+
+  function subtitleCoverageSeconds(text) {
+
+    let last = 0;
+
+    const pattern = /-->\s*([0-9:.,]+)/g;
+
+    let match;
+
+    while ((match = pattern.exec(String(text || "")))) last = Math.max(last, parseVttTimestamp(match[1]));
+
+    return last;
+
+  }
+
+
+
+  function writeVarint(value) {
+
+    const bytes = [];
+
+    let rest = Math.max(0, Math.floor(Number(value) || 0));
+
+    do {
+
+      const part = rest % 128;
+
+      rest = Math.floor(rest / 128);
+
+      bytes.push(rest > 0 ? part | 0x80 : part);
+
+    } while (rest > 0);
+
+    return Uint8Array.from(bytes);
+
+  }
+
+
+
+  // Only the plain-integer fields matter here: a paging cursor is never a string in practice,
+
+  // and guessing at length-delimited fields would corrupt the request.
+
+  function protobufVarintFields(input) {
+
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+
+    const fields = {};
+
+    let position = 0;
+
+    while (position < bytes.length) {
+
+      const [key, afterKey] = readVarint(bytes, position);
+
+      position = afterKey;
+
+      const wireType = key & 0x07;
+
+      const number = Math.floor(key / 8);
+
+      if (wireType === 0) {
+
+        const [value, afterValue] = readVarint(bytes, position);
+
+        position = afterValue;
+
+        fields[number] = value;
+
+      } else if (wireType === 1) position += 8;
+
+      else if (wireType === 2) {
+
+        const [length, afterLength] = readVarint(bytes, position);
+
+        position = afterLength + length;
+
+      } else if (wireType === 5) position += 4;
+
+      else return fields;
+
+    }
+
+    return fields;
+
+  }
+
+
+
+  // Re-encodes one varint field. The new value can be a different byte length, so the message is
+
+  // rebuilt rather than patched in place.
+
+  function protobufSetVarint(input, fieldNumber, value) {
+
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+
+    const pieces = [];
+
+    let position = 0;
+
+    let replaced = false;
+
+    while (position < bytes.length) {
+
+      const start = position;
+
+      const [key, afterKey] = readVarint(bytes, position);
+
+      position = afterKey;
+
+      const wireType = key & 0x07;
+
+      const number = Math.floor(key / 8);
+
+      if (wireType === 0) {
+
+        const [, afterValue] = readVarint(bytes, position);
+
+        position = afterValue;
+
+        if (number === fieldNumber) {
+
+          pieces.push(bytes.subarray(start, afterKey), writeVarint(value));
+
+          replaced = true;
+
+          continue;
+
+        }
+
+      } else if (wireType === 1) position += 8;
+
+      else if (wireType === 2) {
+
+        const [length, afterLength] = readVarint(bytes, position);
+
+        position = afterLength + length;
+
+      } else if (wireType === 5) position += 4;
+
+      else return null;
+
+      pieces.push(bytes.subarray(start, position));
+
+    }
+
+    if (!replaced) return null;
+
+    const total = pieces.reduce((sum, piece) => sum + piece.length, 0);
+
+    const out = new Uint8Array(total);
+
+    let offset = 0;
+
+    for (const piece of pieces) { out.set(piece, offset); offset += piece.length; }
+
+    return out;
+
+  }
+
+
+
+  function grpcWebFrame(payload) {
+
+    const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
+
+    const framed = new Uint8Array(bytes.length + 5);
+
+    framed[0] = 0;
+
+    framed[1] = (bytes.length >>> 24) & 0xff;
+
+    framed[2] = (bytes.length >>> 16) & 0xff;
+
+    framed[3] = (bytes.length >>> 8) & 0xff;
+
+    framed[4] = bytes.length & 0xff;
+
+    framed.set(bytes, 5);
+
+    return framed;
+
+  }
+
+
+
+  // Two or more recorded calls expose the paging parameter by differencing: whatever integer
+
+  // fields moved between them are the cursor, and their spacing is the page size. A start/end
+
+  // pair moves together, which is why several fields are allowed as long as the step matches.
+
+  // One call, or fields moving at different rates, means there is nothing safe to extrapolate.
+
+  function inferSubtitlePaging(payloads) {
+
+    const maps = (payloads || []).map(protobufVarintFields);
+
+    if (maps.length < 2) return null;
+
+    const numbers = new Set();
+
+    for (const map of maps) for (const key of Object.keys(map)) numbers.add(Number(key));
+
+    const fields = [];
+
+    let step = 0;
+
+    for (const number of numbers) {
+
+      if (!maps.every((map) => map[number] != null)) continue;
+
+      const values = Array.from(new Set(maps.map((map) => map[number]))).sort((a, b) => a - b);
+
+      if (values.length < 2) continue;
+
+      const gaps = values.slice(1).map((value, index) => value - values[index]);
+
+      const smallest = Math.min(...gaps);
+
+      if (!(smallest > 0)) return null;
+
+      if (step && smallest !== step) return null;
+
+      step = smallest;
+
+      fields.push({ field: number, max: values[values.length - 1] });
+
+    }
+
+    if (!fields.length || !step) return null;
+
+    return { fields, step };
+
+  }
+
+
+
+  function subtitleCueSpan(text) {
+
+    let start = Infinity;
+
+    let end = 0;
+
+    let count = 0;
+
+    const pattern = /([0-9:.,]+)\s*-->\s*([0-9:.,]+)/g;
+
+    let match;
+
+    while ((match = pattern.exec(String(text || "")))) {
+
+      start = Math.min(start, parseVttTimestamp(match[1]));
+
+      end = Math.max(end, parseVttTimestamp(match[2]));
+
+      count += 1;
+
+    }
+
+    return { start: count ? start : 0, end, count };
+
+  }
+
+
+
+  // With a single recorded call there is nothing to difference, but the cursor can still be found
+
+  // by experiment: change one integer field, ask again, and see whether the reply moved forward.
+
+  // Ordered so the likeliest shapes go first — a position in seconds, then milliseconds, then a
+
+  // plain page index — because every probe costs one request.
+
+  function subtitlePagingProbes(payload, span) {
+
+    const fields = protobufVarintFields(payload);
+
+    const chunk = Math.max(1, Math.round((span?.end || 0) - (span?.start || 0)));
+
+    const probes = [];
+
+    for (const step of [chunk, chunk * 1000, 1]) {
+
+      for (const [key, value] of Object.entries(fields)) {
+
+        const field = Number(key);
+
+        if (probes.some((probe) => probe.field === field && probe.step === step)) continue;
+
+        probes.push({ field, step, value: value + step });
+
+      }
+
+    }
+
+    return probes;
+
+  }
+
+
+
+  // Describes a protobuf message without interpreting it, for diagnostics. String values are
+
+  // reduced to a length and a short ASCII preview: these bodies carry session tokens and must
+
+  // never be reproduced in full into something the user might paste elsewhere.
+
+  function protobufShape(input) {
+
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+
+    const parts = [];
+
+    let position = 0;
+
+    while (position < bytes.length) {
+
+      const [key, afterKey] = readVarint(bytes, position);
+
+      position = afterKey;
+
+      const wireType = key & 0x07;
+
+      const number = Math.floor(key / 8);
+
+      if (wireType === 0) {
+
+        const [value, afterValue] = readVarint(bytes, position);
+
+        position = afterValue;
+
+        parts.push(`${number}=int:${value}`);
+
+      } else if (wireType === 1) { parts.push(`${number}=fixed64`); position += 8; }
+
+      else if (wireType === 2) {
+
+        const [length, afterLength] = readVarint(bytes, position);
+
+        position = afterLength;
+
+        const preview = new TextDecoder().decode(bytes.subarray(position, position + Math.min(length, 8))).replace(/[^\x20-\x7e]/g, ".");
+
+        position += length;
+
+        parts.push(`${number}=bytes[${length}]:${preview}`);
+
+      } else if (wireType === 5) { parts.push(`${number}=fixed32`); position += 4; }
+
+      else { parts.push(`${number}=wire${wireType}?`); break; }
+
+    }
+
+    return parts.join(", ") || "(empty)";
+
+  }
+
+
+
+  // A request carrying nothing but an identifier has no cursor to advance, so whatever comes back
+
+  // is everything the site offers for that video. Saying "the cursor might be a string token"
+
+  // in that case sends the user chasing something that does not exist.
+
+  function subtitlePagingAbsent(payload) {
+
+    const shape = protobufShape(payload);
+
+    const fieldCount = shape === "(empty)" ? 0 : shape.split(", ").length;
+
+    return Object.keys(protobufVarintFields(payload)).length <= 1 && fieldCount <= 2;
+
+  }
+
+
 
   function missingTimeline(segments, savedSequences, skippableSequences) {
     const saved = savedSequences instanceof Set ? savedSequences : new Set(savedSequences || []);
@@ -1053,10 +1833,10 @@
     providers, selectProvider, registerProvider,
     parseAttributeList, normalizeByteRange, rangeHeader, parseHlsPlaylist,
     isoDurationSeconds, expandDashTimeline, parseDashManifest, selectDashTracks,
-    mp4Boxes, concatBytes, makeMp4Box, mergeCmafInitializations, patchCmafFragmentTrackId, patchMp4InitDuration,
+    mp4Boxes, concatBytes, makeMp4Box, mergeCmafInitializations, patchCmafFragmentTrackId, patchMp4InitDuration, buildSidx, buildFreeBox, sidxByteLength,
     mp4TrackTypes, inspectTransportStream, inspectMediaBytes, transportTimestamps,
     ptsDeltaSeconds, assessSkippedSegmentContinuity, assessAdjacentSegmentContinuity,
-    classifyMediaError, missingTimeline, normalizeMediaUrl, sequenceFromUrl, segmentLookup, dashCaptureIndex, mergeDashCaptureTracks,
+    classifyMediaError, missingTimeline, convertSubtitleText, mergeWebVttParts, mergeVttDocuments, subtitleCoverageSeconds, protobufVarintFields, protobufSetVarint, grpcWebFrame, inferSubtitlePaging, subtitleCueSpan, subtitlePagingProbes, webVttToSrt, unconvertedChineseCount, shiftVttCues, SUBTITLE_MODES, protobufStringField, protobufStringFields, protobufShape, subtitlePagingAbsent, grpcWebPayload, grpcWebPayloads, decodeConcatenatedBase64, jwtPayload, subtitleUserIdFromHeaders, normalizeMediaUrl, sequenceFromUrl, segmentLookup, dashCaptureIndex, mergeDashCaptureTracks,
     extensionFromUrl, extensionForCandidate, directFile, directFileUrl
   };
   root.WebKeeperMediaEngine = api;

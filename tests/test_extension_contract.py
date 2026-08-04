@@ -100,6 +100,82 @@ class ExtensionContractTests(unittest.TestCase):
         self.assertIn('message?.type === "open-extension-page"', background)
         self.assertIn('startsWith(`chrome-extension://${chrome.runtime.id}`)', background)
         self.assertNotIn("WebKeeperNative", background)
+        # Qualities came only from URLs the browser happened to request, so a rendition the player
+        # never switched to was invisible. The master playlist lists them all.
+        self.assertIn("function masterPlaylistVariants(", background)
+        self.assertIn("async function expandMasterPlaylist(", background)
+        self.assertIn("fromMasterPlaylist", background)
+        # The endpoint carrying the rest of a subtitle is not named "subtitle", so every API call
+        # is listed — by path and size only, never by body, since these carry session tokens.
+        self.assertIn("function noteApiActivity(", background)
+        self.assertIn('const API_ACTIVITY_KEY = "wkApiActivity";', background)
+        note_activity = background[background.index("function noteApiActivity("):]
+        note_activity = note_activity[:note_activity.index("\n}")]
+        self.assertNotIn("body", note_activity, "the endpoint list must never carry request bodies")
+        self.assertNotIn("requestBody", note_activity)
+
+    def test_every_referenced_element_exists_in_the_markup(self) -> None:
+        # The UI rewrite left listeners bound to buttons that no longer existed, and the resulting
+        # TypeError killed page init: the download centre came up blank. One missing element is
+        # enough to break the whole page, so the reference set must close.
+        for page in ("download", "settings", "popup"):
+            script = (ROOT / "extension" / f"{page}.js").read_text(encoding="utf-8")
+            markup = (ROOT / "extension" / f"{page}.html").read_text(encoding="utf-8")
+            # Some elements are injected by the script itself, so those ids count as present too.
+            present = set(re.findall(r'id="([A-Za-z0-9_-]+)"', markup))
+            present |= set(re.findall(r'id="([A-Za-z0-9_-]+)"', script))
+            referenced = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', script))
+            referenced |= set(re.findall(r'document\.getElementById\("([A-Za-z0-9_-]+)"\)', script))
+            missing = sorted(referenced - present)
+            self.assertEqual([], missing, f"{page}.js references elements {page}.html does not define: {missing}")
+
+    def test_master_playlist_lists_every_rendition(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is not available")
+        # A player offering 1080p/720p/404p appeared as "1 quality" because only the rendition it
+        # actually fetched was ever seen. Every STREAM-INF must be picked up, including the one
+        # whose URL carries no resolution and one written with attributes on later lines.
+        source = r"""
+global.chrome = {
+  runtime: { id: 't', getURL: (p) => p, onInstalled: { addListener() {} }, onMessage: { addListener() {} } },
+  storage: { local: { get: async () => ({}), set: async () => {} } },
+  tabs: { create: async () => ({}), get: async () => ({}) },
+  action: {},
+  i18n: { getMessage: () => '' },
+  webRequest: { onBeforeRequest: { addListener() {} }, onBeforeSendHeaders: { addListener() {} }, onHeadersReceived: { addListener() {} } }
+};
+const fs = require('fs');
+const vm = require('vm');
+const context = vm.createContext(global);
+vm.runInContext(fs.readFileSync('./extension/background.js', 'utf8'), context);
+const master = [
+  '#EXTM3U',
+  '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080',
+  '1920x1080/index.m3u8',
+  '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720',
+  '/v/abc/1280x720/index.m3u8',
+  '#EXT-X-STREAM-INF:BANDWIDTH=400000',
+  '',
+  'low/index.m3u8',
+  '#EXT-X-MEDIA:TYPE=SUBTITLES,URI="sub.m3u8"'
+].join('\n');
+const variants = vm.runInContext('masterPlaylistVariants', context)(master, 'https://cdn.example.com/v/abc/master.m3u8');
+console.log(JSON.stringify(variants));
+"""
+        completed = subprocess.run([node, "-e", source], cwd=ROOT, check=True, capture_output=True, text=True, encoding="utf-8")
+        variants = json.loads(completed.stdout)
+        background = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        self.assertEqual(3, len(variants), "every STREAM-INF must be offered, not only the fetched one")
+        self.assertEqual(
+            ["https://cdn.example.com/v/abc/1920x1080/index.m3u8", "https://cdn.example.com/v/abc/1280x720/index.m3u8", "https://cdn.example.com/v/abc/low/index.m3u8"],
+            [variant["url"] for variant in variants])
+        self.assertEqual(["1920x1080", "1280x720", "auto"], [variant["resolution"] for variant in variants])
+        # A "720p" path can carry 720x404: the manifest's RESOLUTION is the real size and must win
+        # over the marketing label in the URL, or the folder name misreports the quality.
+        source = background[background.index("async function expandMasterPlaylist("):]
+        self.assertIn('variant.resolution && variant.resolution !== "auto" ? variant.resolution : identity.resolution', source)
+        self.assertEqual(400000, variants[2]["bandwidth"])
 
     def test_background_opens_whitelisted_extension_pages(self) -> None:
         node = shutil.which("node")
@@ -120,6 +196,7 @@ global.chrome = {
   action: {},
   i18n: { getMessage: () => '' },
   webRequest: {
+    onBeforeRequest: { addListener() {} },
     onBeforeSendHeaders: { addListener() {} },
     onHeadersReceived: { addListener() {} }
   }
@@ -170,6 +247,7 @@ global.chrome = {
   action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
   i18n: { getMessage: () => '' },
   webRequest: {
+    onBeforeRequest: { addListener() {} },
     onBeforeSendHeaders: { addListener() {} },
     onHeadersReceived: { addListener(fn) { headersReceived = fn; } }
   }
@@ -215,6 +293,77 @@ setTimeout(() => {
         self.assertIn('removeEntry("segments", { recursive: true })', script)
         self.assertIn('id: "default-root"', script)
         self.assertIn("async function deleteOutput()", script)
+        # The validity check deletes what it condemns, so an unreadable or still-encrypted segment
+        # must never be condemned: that destroyed segments that were perfectly good.
+        self.assertIn('if (verdict === "bad") bad.push(record);', script)
+        self.assertIn("verifyUndecided", script)
+        # One failing segment used to reject the whole batch and end the run.
+        self.assertIn("const DIRECT_SEGMENT_RETRIES = 3;", script)
+        self.assertIn("directSegmentsSkipped", script)
+        # The download centre started whichever candidate happened to be first, and subtitles could
+        # only be reached by downloading the whole video first.
+        self.assertIn("data-quality-for=", script)
+        self.assertIn("function qualityHeight(", script)
+        self.assertIn('location.href = `download.html?candidate=${encodeURIComponent(candidateId)}&mode=subtitles`;', script)
+        self.assertIn('if (state.mode === "subtitles") {', script)
+        self.assertIn("saveSubtitlesOnly", script)
+        # A blocked well-known folder was swallowed as a cancel, so the user retried it forever.
+        self.assertIn("async function reportFolderPickFailure(", script)
+        self.assertIn("folderBlocked", script)
+        # The remembered root becomes the parent of every later task, so name it as such.
+        self.assertIn("chosenRootFolder", script)
+        # Internal verdict codes must not reach the user, and a source whose clock jumps hours must
+        # not leave hours of blank timeline in the finished file.
+        self.assertIn("function describeTimelineJump(", script)
+        # A discontinuity is not actionable, so it must not take over the status line.
+        self.assertNotIn("state.message = message;" + chr(10) + "  log(message);", script)
+        # The real invariant: an internal verdict code must never end up in a user-facing string.
+        for locale in ("zh_CN", "en"):
+            messages = (ROOT / "extension" / "_locales" / locale / "messages.json").read_text(encoding="utf-8")
+            self.assertNotIn("PTS_", messages, f"{locale} exposes an internal verdict code")
+        self.assertNotIn('verdict.reason || ""], `', script)
+        self.assertIn("function remainingTimeText(", script)
+        # The page title is the site's name, not the video's, so the product id names the output.
+        self.assertIn("const product = String(state?.product || candidate?.product || \"\").trim();", script)
+        self.assertIn("safeName(directBase || product || pageTitle || \"video\")", script)
+        # Subtitles are saved before the merge, so they must be named from the same base the merge
+        # uses; falling back to the page title produced a name unrelated to the video file.
+        self.assertIn("const base = state.outputName ? state.outputName.replace(/\.[^.]+$/, \"\") : preferredOutputBaseName();", script)
+        # The site answers an anonymous request with a five-minute preview (5547 bytes) and the
+        # page's own session with the whole track (246 kB), so the call must run inside the page.
+        self.assertIn("async function postInPage(", script)
+        self.assertIn("subtitleViaPage", script)
+        # The API sits on another subdomain, so even the page's fetch is cross-origin: what decides
+        # preview-vs-whole-track is the header set, and the playlist request's headers have none.
+        self.assertIn("function subtitleCallHeaders(", script)
+        # The AES IV comes from the signed-in id, which is not always in a header. Every id the
+        # page holds is tried and the decrypted text decides which was right.
+        self.assertIn("async function pageIdentityCandidates(", script)
+        # The AES key is a literal in the site's own bundle, so it is discovered and verified too
+        # rather than hard-coded per site.
+        self.assertIn("async function pageDecryptionKeys(", script)
+        # An empty reply arrives at a fixed period on some sites; throwing made it fail forever
+        # instead of being judged the same way every other gap is.
+        self.assertIn('const verdict = await maybeMarkSkippable(segment, { tinySize: encrypted.byteLength });', script)
+        self.assertIn("downloadedItemEmpty", script)
+        # On a source with hundreds of discontinuities the continuity test can never decide, so a
+        # segment the server answers empty twice must be accepted rather than retried forever.
+        self.assertIn("const emptySegmentCounts = new Map();", script)
+        self.assertIn("segmentConfirmedEmpty", script)
+        # The player's own copy needs the hook in place before the page asks for it.
+        self.assertIn("async function registerPageCaptureOnLoad(", script)
+        self.assertIn('runAt: "document_start"', script)
+        # With a custom folder nothing is exported, so a "subtitles" subfolder just hid the file,
+        # and the result line never said where it went.
+        self.assertIn('? await workDirectory.getDirectoryHandle("subtitles", { create: true })', script)
+        self.assertIn("subtitleSavedAt", script)
+        # Players auto-load an external track only when the name matches the video exactly, so a
+        # lone track must not carry a "subtitle-01" suffix.
+        self.assertIn("const label = urls.length > 1", script)
+        self.assertIn('const subtitleName = `${safeName(base || "video")}${label}.${safeName(ext, "vtt")}`;', script)
+        self.assertIn('if (!sample.includes("-->")) continue;', script)
+        self.assertIn("call.headers || candidate?.headers || {}", script)
+        self.assertIn('headers: { ...(observed.headers || {}) }', (ROOT / "extension" / "background.js").read_text(encoding="utf-8"))
         self.assertIn("navigator.storage.getDirectory()", script)
         self.assertIn("chrome.downloads.download", script)
         self.assertIn("chrome.downloads.show", script)
@@ -223,9 +372,344 @@ setTimeout(() => {
         # Legacy data/captures can be imported into the pure-extension task model.
         self.assertIn("async function importLegacyCapture()", script)
         self.assertIn("async function importLegacyVariant(", script)
+        # A work folder holds several quality folders; importing them all unasked copied gigabytes.
+        self.assertIn("async function chooseLegacyVariants(", script)
+        # Importing must not duplicate gigabytes: segments are referenced in place by default.
+        self.assertIn('const LEGACY_LINK_SOURCE = "legacy-link"', script)
+        self.assertIn("async function readStoredSegment(", script)
+        # An imported playlist only has placeholder URLs, so gaps can only be filled by attaching
+        # the task to the live page instead of trying to download legacy.local.
+        self.assertIn("async function bindLegacyTaskToLivePlaylist(", script)
+        # A hand-typed import name (atkd431) must still match the URL id (atkd00431), and a
+        # manual attach button must exist for when even that fails.
+        self.assertIn("function normalizedWorkKey(", script)
+        self.assertIn("async function bindToDetectedVideo(", script)
+        # Thin gaps must not each claim a whole pixel, or the bar reads far emptier than it is.
+        self.assertIn("const columns = new Float32Array(width);", script)
+        self.assertNotIn("Math.max(1, right - left)", script)
+        # Removing a task must be able to reclaim its data, and private windows must warn.
+        self.assertIn("removeTaskDataConfirm", script)
+        self.assertIn("function inPrivateWindow(", script)
+        # The job list is persistent while task state is not, so orphaned rows must not
+        # advertise a "continue" link that dead-ends.
+        self.assertIn("const liveJobIds = new Set();", script)
+        self.assertIn("taskEntryLost", script)
+        self.assertIn("privateWindowEphemeral", script)
+        # One click must move a task onto real disk and carry the already-saved segments.
+        self.assertIn("async function switchTaskToFolder(", script)
+        # A folder of .ts files alone cannot describe its own gaps, so the playlist is kept
+        # beside them and the importer also looks one level up.
+        self.assertIn("async function persistPlaylistBesideSegments(", script)
+        self.assertIn("variant.parentHandle", script)
+        self.assertIn("legacySyntheticNote", script)
+        self.assertIn('{ id: "switchFolder"', script)
+        self.assertIn('  switchFolder: ', script)
+        self.assertIn('dbPut("handles", { id: "default-root", handle: picked })', script)
+        self.assertIn("taskLostPrivate", script)
+        self.assertIn("async function publishImportedSubtitles(", script)
+        # Sidecar subtitles are often an HLS playlist or an extensionless API URL; both were
+        # detected and then thrown away by the extension-only filter.
+        self.assertIn("async function fetchSubtitleContent(", script)
+        # An imported task carries its own candidate, so subtitles seen on the page must be
+        # merged into it and searchable on demand from the master playlist.
+        self.assertIn("async function discoverSubtitles(", script)
+        # This site wraps subtitles in protobuf + base64 + AES-CBC; without that the API
+        # response is unreadable and looked like "no subtitles".
+        self.assertIn("async function decodeEncryptedSubtitle(", script)
+        # Text conversion and the segmented timeline offset live in the engine and are settable.
+        self.assertIn("WebKeeperMediaEngine.mergeWebVttParts(parts, subtitleConvertMode)", script)
+        self.assertIn("subtitleConvertMode = WebKeeperMediaEngine.SUBTITLE_MODES.includes(", script)
+        self.assertIn('id="subtitleConvert"', (ROOT / "extension" / "settings.html").read_text(encoding="utf-8"))
+        # The Chinese table is incomplete, so both the settings page and the run must say so.
+        self.assertIn("subtitleConvertHint", (ROOT / "extension" / "settings.html").read_text(encoding="utf-8"))
+        self.assertIn("subtitleConvertPartial", script)
+        # The built-in table has 90 entries and gets one-to-many characters wrong (头发 -> 頭發,
+        # 皇后 -> 皇後), so real conversion uses OpenCC's dictionaries and the table is only a
+        # fallback whose warning fires only when it actually ran.
+        self.assertIn("async function ensureOpenCC(", script)
+        self.assertIn('tag.src = "vendor/opencc/opencc-full.js";', script)
+        self.assertIn('if (!openCcConverters && ["zh-hans", "zh-hant"].includes(subtitleConvertMode)', script)
+        bundle = ROOT / "extension" / "vendor" / "opencc" / "opencc-full.js"
+        self.assertTrue(bundle.is_file(), "the OpenCC dictionaries must ship with the extension")
+        self.assertGreater(bundle.stat().st_size, 500_000)
+        self.assertIn('id="subtitleFormat"', (ROOT / "extension" / "settings.html").read_text(encoding="utf-8"))
+        self.assertIn("function applySubtitleFormat(", script)
+        # "0/1 saved" with the reason only in the log gives the user nothing to act on.
+        self.assertIn("subtitlesSavedWithError", script)
+        self.assertIn("subtitleUnknownFormat", script)
+        self.assertIn("subtitleDecryptFailed", script)
+        # The subtitle endpoint is gRPC-style: a plain GET answers 415, so the original POST
+        # body is recorded and replayed, and the page's own copy is preferred.
+        self.assertIn("candidate?.subtitleRequests?.[url]", script)
+        self.assertIn("subtitleFromPageBuffer", script)
+        # Copying only the URLs left the replay without its body and hit 415 again.
+        self.assertIn("candidate.subtitleRequests = { ...(candidate.subtitleRequests || {}), ...(item.subtitleRequests || {}) };", script)
+        self.assertIn("subtitleNeedsReplay", script)
+        self.assertIn("WebKeeperMediaEngine.grpcWebPayload(", script)
+        # The track arrives in chunks, so every recorded call is replayed and merged.
+        self.assertIn("candidate?.subtitleCalls", script)
+        self.assertIn("WebKeeperMediaEngine.mergeVttDocuments(", script)
+        # A track that stops where playback stopped must be reported, not silently saved.
+        self.assertIn("WebKeeperMediaEngine.subtitleCoverageSeconds(", script)
+        self.assertIn("subtitleCoverageShort", script)
+        # Short coverage must be fixable without replaying playback by hand: the paging cursor is
+        # extrapolated directly, and the player sweep is the fallback that always works.
+        self.assertIn("async function extendSubtitleByPaging(", script)
+        self.assertIn("async function sweepPlayerForSubtitles(", script)
+        self.assertIn("WebKeeperMediaEngine.inferSubtitlePaging(", script)
+        self.assertIn('{ id: "sweepSubtitles"', script)
+        self.assertIn('  sweepSubtitles: ', script)
+        self.assertIn("{ ignorePause: true }", script)
+        # An imported task is named after its folder, so matching calls by product alone loses
+        # every call recorded on the page it is attached to.
+        self.assertIn("const sameTab = Number(candidate.tabId) >= 0", script)
+        # Zero recorded calls has several causes and only the right one is actionable.
+        self.assertIn("subtitleSweepNeedsDiscover", script)
+        self.assertIn("subtitleSweepNoCalls", script)
+        self.assertIn("subtitleSweepNoNew", script)
+        self.assertIn('{ id: "extractSubtitles"', script)
+        self.assertIn('  extractSubtitles: ', script)
+        self.assertIn("async function extractSubtitlesDirectly(", script)
+        # A candidate stored by an older build only has the one-per-URL map; those are real calls.
+        self.assertIn("seed(candidate.subtitleRequests);", script)
+        # One recorded call is enough: the cursor is found by probing and verified by the reply.
+        self.assertIn("async function probeSubtitlePaging(", script)
+        self.assertIn("WebKeeperMediaEngine.subtitlePagingProbes(", script)
+        self.assertIn("subtitleProbeFailed", script)
+        # The page's buffered copy is one chunk of a chunked API, not the whole track; returning it
+        # early skipped the extension entirely and silently reproduced the short save.
+        self.assertIn("if (asDocument) documents.push(asDocument);", script)
+        self.assertIn("if (calls.length) await extendSubtitleByPaging(url, calls, documents);", script)
+        self.assertIn("subtitleAssembled", script)
+        # log() writes into a collapsed <details>, so the result and the reason must also reach
+        # the status line, and the panel starts open.
+        self.assertIn('state.message = [headline, reach, where, subtitleNote].filter(Boolean).join(" ");', script)
+        self.assertIn("subtitleReach", script)
+        # The remuxer emits a fragmented MP4; without an index a player must walk every fragment
+        # before it can start, which on a network share is minutes of waiting.
+        self.assertIn("async function writeSegmentIndex(", script)
+        self.assertIn("WebKeeperMediaEngine.buildSidx(references)", script)
+        self.assertIn('await writable.write({ type: "write", position: sidxPosition, data: sidx });', script)
+        # Space is reserved before the fragments, because a sidx has to precede what it indexes.
+        self.assertIn("sidxCapacity = WebKeeperMediaEngine.sidxByteLength(expected.length + 16);", script)
+        # The remuxer emits one fragment per track, so indexing each separately would double the
+        # duration the index reports; one entry covers everything a source segment produced.
+        self.assertIn("if (subsegmentBytes > 0) {", script)
+        # The rewrite's contract: one place decides what is offered, one place places it, and the
+        # ranking is bounded. Forty-four scattered .hidden assignments were the old failure mode.
+        self.assertIn("function availableActions(", script)
+        self.assertIn("function actionsFor(", script)
+        self.assertIn("function renderActions(", script)
+        self.assertIn("const ACTION_HANDLERS = {", script)
+        self.assertIn("if (secondary.length >= 2) break;", script)
+        # Every declared action must be dispatchable, and nothing may be wired that is not declared.
+        import re as _re
+        declared = set(_re.findall(r'\{ id: "([a-zA-Z]+)", when:', script))
+        handlers = script[script.index("const ACTION_HANDLERS = {"):]
+        wired = set(_re.findall(r"^  ([a-zA-Z]+): ", handlers[:handlers.index("};")], _re.M))
+        self.assertEqual(declared, wired, "declared actions and wired handlers must match exactly")
+        self.assertGreaterEqual(len(declared), 18)
+        # A gRPC-Web reply can be server-streaming and a protobuf field can repeat; taking only the
+        # first of either is what made a whole track look like its opening minutes.
+        self.assertIn("WebKeeperMediaEngine.grpcWebPayloads(", script)
+        self.assertIn("WebKeeperMediaEngine.protobufStringFields(", script)
+        self.assertIn("subtitleFramesDecoded", script)
+        # Several indistinguishable explanations for a short track mean the real shape has to be
+        # observable rather than guessed at.
+        self.assertIn("async function dumpSubtitleDiagnostics(", script)
+        self.assertIn("WebKeeperMediaEngine.protobufShape(", script)
+        # An id-only request has no cursor, so probing it wastes requests and the advice to replay
+        # playback is simply wrong.
+        self.assertIn("WebKeeperMediaEngine.subtitlePagingAbsent(", script)
+        self.assertIn("subtitleNoPaging", script)
+        # A track that already spans the video must not be probed, and its "why not more" note must
+        # not be shown: both only make a complete result look broken.
+        self.assertIn("if (videoSeconds > 0 && coverage >= videoSeconds * 0.9) return 0;", script)
+        self.assertIn('if (coverageSeconds > 0 && videoSeconds > 0 && coverageSeconds >= videoSeconds * 0.9) subtitleNote = "";', script)
+        # A neighbouring part may restart its clock at zero, so the probe accepts new cues rather
+        # than a later timestamp, and the diagnostics show what the neighbours actually return.
+        self.assertIn("if (fresh.count > 0 && grew) {", script)
+        self.assertIn("SAME as base", script)
+        self.assertIn('{ id: "subtitleDiagnostics"', script)
+        self.assertIn('  subtitleDiagnostics: ', script)
+        # The log is reachable in one click; it no longer starts expanded because the result and the
+        # reason now reach the status line on their own.
+        markup = (ROOT / "extension" / "download.html").read_text(encoding="utf-8")
+        self.assertIn('<details id="diagnosticsPanel" class="card">', markup)
+        # Detail panels collapse instead of all standing open at once.
+        self.assertIn('<details id="missingPanel" class="panel"', markup)
+        self.assertIn('<details id="sourcePanel" class="panel"', markup)
+        # Actions are rendered from the matrix into one container, not hard-coded in the markup.
+        self.assertIn('<div id="actionBar"></div>', markup)
+        self.assertNotIn('<button id=', markup)
+        self.assertIn("item.subtitleCalls = calls.slice(-200);", (ROOT / "extension" / "background.js").read_text(encoding="utf-8"))
+        hook = (ROOT / "extension" / "page-capture.js").read_text(encoding="utf-8")
+        self.assertIn("isSubtitleResponse", hook)
+        # A grpc-web-text reply arrives as a string, so buffering only ArrayBuffer/Blob dropped the
+        # player's own copy and left us re-requesting a short preview.
+        self.assertIn("request.responseText", hook)
+        self.assertIn("new TextEncoder().encode(text)", hook)
+        self.assertIn('subtitleConvertMode: $("subtitleConvert").value', (ROOT / "extension" / "settings.js").read_text(encoding="utf-8"))
+        self.assertIn("WebKeeperMediaEngine.subtitleUserIdFromHeaders", script)
+        self.assertIn('if (event.kind === "subtitle" && event.url)', script)
+        self.assertIn("function mergeWebVttParts(", (ROOT / "extension" / "media-engine.js").read_text(encoding="utf-8"))
+        self.assertIn("candidate?.subtitleTypes", script)
+        background = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        self.assertIn("item.subtitleTypes = {", background)
+        self.assertIn("isKnownSubtitleUrl(url, confirmed = null)", background)
+        self.assertIn("/subtitle/i.test(new URL(details.url).pathname)", background)
+        self.assertIn("pendingSubtitleRequests", background)
+        self.assertIn('["requestBody"]', background)
+        self.assertIn("const DIRECT_FILL_BATCH", script)
+        self.assertIn('{ id: "bindPage"', script)
+        self.assertIn('state.source === "legacy-import" && !state.legacyBoundPlaylistUrl', script)
+        self.assertIn('state.errorCode = "LEGACY_PLAYLIST_MISMATCH"', script)
+        # Binding used to only relabel the status, which left the task idle; it must start capture.
+        self.assertIn("await runCapture();", script.split("async function bindLegacyTaskToLivePlaylist")[1].split("async function ")[0])
+        # The page must show whether it is attached to a page and where segments come from.
+        self.assertIn("function connectionLines(", script)
+        # Waiting for a playlist event never fires on VOD, so any matching request must bind.
+        self.assertIn("async function liveCandidatePlaylistUrls(", script)
+        self.assertNotIn('state.source === "legacy-import" && event.kind === "playlist"', script)
+        # Actions that drive the page must be disabled while nothing is attached.
+        self.assertIn("function attachedToPage(", script)
+        # Availability now lives in the matrix rather than in a scattered .disabled assignment.
+        self.assertIn("disabled: smartFillRunning || !attached", script)
+        self.assertIn("noVideoPageKnown", script)
+        # A gap that was downloaded-but-empty needs a different fix than one never downloaded.
+        self.assertIn("function rangeTinyCount(", script)
+        self.assertIn("missingKindNever", script)
+        self.assertIn("missingKindTiny", script)
+        # Thousands of gaps cannot all be rendered, so they are sortable and exportable.
+        self.assertIn("function sortedMissingRanges(", script)
+        self.assertIn("data-missing-sort", script)
+        self.assertIn("async function copyMissingList(", script)
+        # The list must not reshuffle and reset its scroll on every saved segment.
+        self.assertIn("function refreshMissingSnapshot(", script)
+        self.assertIn("if (missingKey !== missingRenderedKey)", script)
+        # Order stays put while the numbers keep moving, and the arriving gap breathes.
+        self.assertIn("data-range-count", script)
+        self.assertIn('row.classList.toggle("live"', script)
+        self.assertIn("data-missing-page", script)
+        self.assertIn('id="missingPageInput"', script)
+        # A gap splitting in two must not reshuffle the list under the reader.
+        self.assertIn("const rankFor = (range) =>", script)
+        # The bar shows the whole timeline with the gaps punched out.
+        self.assertIn("function drawCoverage(", script)
+        self.assertIn("function coverageInfoAt(", script)
+        # A DevTools-style feed of what is being fetched right now, with sequence and timeline position.
+        self.assertIn("function noteSegmentActivity(", script)
+        # A strictly serial queue could never keep up with a player seeking ahead.
+        self.assertIn("function runCaptureSegment(", script)
+        # Scattered one-segment gaps are mostly seek overhead; fetch them directly instead.
+        self.assertIn("async function fillGapsDirectly(", script)
+        # The merge aborts on the first bad segment; the verify pass reports them all and
+        # turns them back into gaps instead.
+        self.assertIn("async function verifyAllSegments(", script)
+        # The minutes of commit/validate/export work after 100% must not be silent.
+        self.assertIn("mergeCommitting", script)
+        self.assertIn("mergeValidating", script)
+        self.assertIn("alert(state.message);\n  } catch (error) {", script.replace("    alert(state.message);", "alert(state.message);"))
+        # A large output must stream into a user-picked file instead of dying on the OPFS quota.
+        self.assertIn("async function outputSpaceShortfall(", script)
+        self.assertIn("async function chooseExternalOutputHandle(", script)
+        self.assertIn("async function noteMergeProgress(", script)
+        # TDZ regression guard: render() must declare `merging` before the status pill uses it.
+        render_src = script.split("function render() {")[1].split("\nfunction ")[0]
+        self.assertLess(render_src.index('const merging = '), render_src.index('merging ? `'))
+        self.assertIn("externalOutputHandle", script)
+        self.assertIn("outputFailedQuota", script)
+        # After a quota failure there must be a way out: pick a file inside the click gesture.
+        self.assertIn("presetExternalHandle", script)
+        merge_src = script.split("async function mergeOutput")[1].split("\nasync function saveSubtitles")[0]
+        self.assertIn('state.errorCode = "OUTPUT_QUOTA"', merge_src)
+        # Big outputs must pick their destination inside the click gesture, before slow work.
+        self.assertIn("const LARGE_OUTPUT_BYTES", script)
+        finalize_src = script.split("async function finalizeDownloadedTask")[1].split("\nasync function ")[0]
+        self.assertIn("chooseExternalOutputHandle", finalize_src)
+        self.assertIn('{ id: "mergeExternal"', script)
+        # Continue on a fully saved task must point at merging, not silently re-run capture.
+        self.assertIn("allSavedCreateNow", script)
+        self.assertIn('{ id: "verifySegments"', script)
+        self.assertIn("function hasRealSegmentUrls(", script)
+        self.assertIn("if (authFailures >= 8)", script)
+        # Back off under pressure instead of hammering until the site cuts the session off.
+        self.assertIn("if (pacingMs) await waitFor(pacingMs);", script)
+        self.assertIn('const rateLimited = /\b429\b/.test(error.message);', script)
+        # Both pacing knobs are user settings.
+        settings_html = (ROOT / "extension" / "settings.html").read_text(encoding="utf-8")
+        self.assertIn('id="pageBufferWait"', settings_html)
+        self.assertIn('id="captureConcurrency"', settings_html)
+        self.assertIn('{ id: "fillDirect"', script)
+        # Sending ArrowRight as well as moving currentTime made those sites jump twice per step.
+        self.assertIn("if (Math.abs(video.currentTime - before) < 0.25) {", script)
+        # One alert per unfinished gap is an alert storm when there are hundreds of them.
+        self.assertNotIn("alert(remainMsg);", script)
+        self.assertNotIn("alert(nextMsg);", script)
+        self.assertIn("smartFillRunningPill", script)
+        # A gap that cannot be filled must be skipped, not end the whole run.
+        self.assertIn("smartFillGaveUp.add(rangeKey(range));", script)
+        self.assertIn("const range = ranges.find((item) => !smartFillGaveUp.has(rangeKey(item)));", script)
+        self.assertNotIn("throw new Error(stuck)", script)
+        self.assertNotIn("alert(skewMessage)", script)
+        # Capture concurrency is a user setting, not a constant.
+        self.assertIn("if (captureActive < captureConcurrency) start();", script)
+        self.assertIn("captureConcurrency = [1, 2, 4, 6, 8].includes(", script)
+        settings_html = (ROOT / "extension" / "settings.html").read_text(encoding="utf-8")
+        settings_js = (ROOT / "extension" / "settings.js").read_text(encoding="utf-8")
+        self.assertIn('id="captureConcurrency"', settings_html)
+        self.assertIn('captureConcurrency: Number($("captureConcurrency").value)', settings_js)
+        self.assertIn("function renderActivity(", script)
+        self.assertIn('lastSegmentSource = "page-buffer"', script)
+        self.assertIn('lastSegmentSource = "task-fetch"', script)
+        self.assertIn('lastSegmentSource = "page-session"', script)
+        self.assertIn('id="activityList"', (ROOT / "extension" / "download.html").read_text(encoding="utf-8"))
+        self.assertIn("data-live-mark", script)
+        # Rereading every stored record per saved segment is what made capture feel slow.
+        self.assertIn("async function savedSequenceSet(", script)
+        self.assertIn("function noteSavedSequence(", script)
+        self.assertIn("if (!force && Date.now() - lastMissingComputeAt < 700)", script)
+        self.assertIn('id="coverage"', (ROOT / "extension" / "download.html").read_text(encoding="utf-8"))
+        # A bound task must never fetch the imported placeholder playlist again.
+        self.assertIn('if (state?.legacyBoundPlaylistUrl) urls = urls.filter(', script)
+        self.assertIn("const MISSING_PAGE_SIZE = 50;", script)
+        self.assertIn(".range.live", (ROOT / "extension" / "download.html").read_text(encoding="utf-8"))
+        # A player inside a shadow root must still be found, and a not-yet-ready one not filtered out.
+        self.assertEqual(4, script.count("if (node.shadowRoot) collect(node.shadowRoot, out);"))
+        self.assertNotIn('querySelectorAll("video")].filter', script)
+        # A closed tab and a page without a player need different advice.
+        self.assertIn("async function reattachVideoTab(", script)
+        self.assertIn('return { ok: false, reason: "NO_TAB" };', script)
+        self.assertIn("function playerFailureMessage(", script)
+        self.assertIn("state.lastSeenAt = Date.now();", script)
+        self.assertIn('id="sourcePanel"', (ROOT / "extension" / "download.html").read_text(encoding="utf-8"))
+        self.assertNotIn("ofje", script)
+        self.assertIn("async function ensureLegacySource(", script)
+        self.assertIn("copyIntoStorage = false", script)
+        self.assertIn('dbPut("handles", { id: `legacy:${jobId}`, handle: variant.handle })', script)
+        # The merge paths must read through the resolver, or a linked task cannot produce a video.
+        merge_source = script.split("async function createMp4FromTransportStream")[1].split("async function saveSubtitles")[0]
+        self.assertEqual(3, merge_source.count("await readStoredSegment("))
+        self.assertNotIn("segmentDirectory.getFileHandle(record.fileName)", merge_source)
+        self.assertIn("for (const variant of chosen)", script)
+        # These three made a 9k-segment import quadratic or unyielding, which crashed the tab.
+        self.assertIn("function recordSkipVerdict(", script)
+        self.assertNotIn("state.segmentSkipVerdicts = { ...(state.segmentSkipVerdicts", script)
+        self.assertIn("if (examined >= MAX_RECLASSIFY_PER_PASS)", script)
+        self.assertIn("if (skippableCache.jobId !== (state?.id || null))", script)
         self.assertIn('source: "legacy-import"', script)
         self.assertIn("https://legacy.local/aes-key/", script)
         self.assertIn('id="importLegacy"', script)
+        # Detections that were never downloaded must be dismissable, one work or all of them.
+        self.assertIn("async function dismissCandidates(", script)
+        self.assertIn("data-dismiss-candidates", script)
+        self.assertIn('type: "remove-candidates"', script)
+        background = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        self.assertIn('message?.type === "remove-candidates"', background)
+        handler = background.split('message?.type === "remove-candidates"')[1].split('message?.type ===')[0]
+        # Dismissing a detection must never reach jobs, files or checkpoints.
+        self.assertIn("CANDIDATES_KEY", handler)
+        self.assertNotIn("JOBS_KEY", handler)
         self.assertIn("importLegacyCapture", (ROOT / "extension" / "_locales" / "zh_CN" / "messages.json").read_text(encoding="utf-8"))
 
     def test_capture_recovers_quality_switches_and_session_bound_segments(self) -> None:
