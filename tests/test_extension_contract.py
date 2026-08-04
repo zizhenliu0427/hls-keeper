@@ -22,7 +22,15 @@ class ExtensionContractTests(unittest.TestCase):
         self.assertEqual("zh_CN", manifest["default_locale"])
         self.assertEqual("split", manifest["incognito"])
         self.assertEqual("__MSG_appName__", manifest["name"])
-        self.assertEqual("0.3.9", manifest["version"])
+        version = manifest["version"]
+        self.assertEqual("0.4.6", version)
+        # These three drifted apart before: the engine version and the READMEs must follow the manifest.
+        background = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        self.assertIn(f'const SCRIPT_VERSION = "web-keeper-extension-{version}"', background)
+        for readme in ("README.md", "README.zh-CN.md"):
+            text = (ROOT / readme).read_text(encoding="utf-8")
+            self.assertIn(f"**{version}**", text, f"{readme} states a different version")
+            self.assertIn(f"dist/Web-Keeper-{version}.zip", text, f"{readme} points at a different package")
 
     def test_declared_icons_exist_at_their_declared_size(self) -> None:
         manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
@@ -212,15 +220,70 @@ setTimeout(() => {
         self.assertIn("chrome.downloads.show", script)
         self.assertIn('state.mode = "browser-assisted"', script)
         self.assertNotIn("nativeMessaging", script)
+        # Legacy data/captures can be imported into the pure-extension task model.
+        self.assertIn("async function importLegacyCapture()", script)
+        self.assertIn("async function importLegacyVariant(", script)
+        self.assertIn('source: "legacy-import"', script)
+        self.assertIn("https://legacy.local/aes-key/", script)
+        self.assertIn('id="importLegacy"', script)
+        self.assertIn("importLegacyCapture", (ROOT / "extension" / "_locales" / "zh_CN" / "messages.json").read_text(encoding="utf-8"))
 
     def test_capture_recovers_quality_switches_and_session_bound_segments(self) -> None:
         download = (ROOT / "extension" / "download.js").read_text(encoding="utf-8")
         engine = (ROOT / "extension" / "media-engine.js").read_text(encoding="utf-8")
+        html = (ROOT / "extension" / "download.html").read_text(encoding="utf-8")
         self.assertIn("function segmentLookup", engine)
         self.assertIn("async function adoptPlaylistForSegment", download)
         self.assertIn("async function locateCaptureSegment", download)
         self.assertIn("function deferCaptureSegment", download)
         self.assertIn("async function replayPendingCaptureSegments", download)
+        # A failed save must come back on its own, and only a bounded number of times.
+        self.assertIn("async function reportCaptureItemError", download)
+        self.assertIn("if (attempts > MAX_CAPTURE_RETRIES) return false;", download)
+        self.assertIn("captureRetryCounts.delete(event.url);", download)
+        self.assertIn("assistedItemGaveUp", download)
+        # An unfinished task must keep working when the same video is reopened in a new tab.
+        self.assertIn("if (event.product !== candidate.product) return false;", download)
+        self.assertIn("if (event.pageUrl && candidate.pageUrl && event.pageUrl !== candidate.pageUrl) return false;", download)
+        self.assertIn("candidate.tabId = Number(event.tabId);", download)
+        # Faster playback makes the player request segments sooner; it must survive a resume.
+        self.assertIn("async function applyCaptureSpeed", download)
+        self.assertIn("video.playbackRate = wanted;", download)
+        self.assertIn("state.captureSpeed = wanted;", download)
+        self.assertIn('id="captureSpeed"', html)
+        # When the site blocks playbackRate, fall back to +10s/sec seeking (ArrowRight-style).
+        self.assertIn("function startSeekBoost", download)
+        self.assertIn("async function stepSeekForward", download)
+        self.assertIn("function normalizedSeekBoostSettings", download)
+        self.assertIn("async function applySeekBoostSettingsFromInputs", download)
+        self.assertIn('value="seek10"', html)
+        self.assertIn('id="seekBoostInterval"', html)
+        self.assertIn('id="seekBoostStep"', html)
+        self.assertIn("captureSpeedMode = \"seek\"", download)
+        self.assertIn("const MIN_SEGMENT_BYTES = 188", download)
+        self.assertIn("function startProgressWatchdog", download)
+        self.assertIn("async function checkProgressStall", download)
+        self.assertIn("stallCaptureAlert", download)
+        self.assertIn("smartFillNextRange", download)
+        self.assertIn("smartFillSeekSkew", download)
+        self.assertIn("downloadedItemTooSmall", download)
+        self.assertIn("allFrames: true", download)
+        self.assertIn("async function classifySkippedSequence", download)
+        self.assertIn("async function reclassifySkippableGaps", download)
+        self.assertIn("assessSkippedSegmentContinuity", download)
+        self.assertIn("assessAdjacentSegmentContinuity", engine)
+        self.assertIn("async function checkAdjacentTimeline", download)
+        self.assertIn("async function prepareTimelineAfterIdle", download)
+        self.assertIn("async function adjustTimelineShiftAndContinue", download)
+        self.assertIn("timelineShiftAdjusted", download)
+        self.assertIn("transportTimestamps", engine)
+        # Subtitles declared in an MPD must reach the same saving path as HLS ones.
+        self.assertIn("function adoptDashSubtitles", download)
+        self.assertIn("item.url && !item.segmented", download)
+        # Both stream types must retry deferred items when the task resumes.
+        self.assertEqual(2, download.count("    await replayQueuedCaptureEvents(queued);\n    await replayPendingCaptureSegments();"))
+        # Pausing aborts requests on purpose; that is not a failed item.
+        self.assertIn("  if (paused) {\n    deferCaptureSegment(event);\n    return;\n  }", download)
         self.assertIn("async function fetchSegmentInPage", download)
         self.assertIn('cacheMode: "force-cache"', download)
         self.assertIn("capturePlaylistLocked = Number(state.done || 0) > 0", download)
@@ -314,7 +377,7 @@ require('./extension/page-capture.js');
         # A request the player cancelled must never consume the wait twice.
         self.assertIn("pageBufferGaveUp.has(url) ? 0 : pageBufferWaitMs", download)
         # A live stream never ends by itself, so it must not finalise on its own.
-        self.assertIn("if (!state.isLive && state.total && state.done >= state.total && autoFinalize)", download)
+        self.assertIn("if (!state.isLive && state.total && coveredSegmentCount() >= state.total && autoFinalize)", download)
         self.assertIn('const isLive = dashCapture.manifest.type === "dynamic"', download)
         self.assertIn('"page-capture.js",', package)
 

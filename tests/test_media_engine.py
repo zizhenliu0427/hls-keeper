@@ -191,6 +191,45 @@ console.log(JSON.stringify({
         self.assertEqual({"trackId": "v", "index": 4, "kind": "segment"}, result["newSegment"])
         self.assertEqual(1, result["audioKept"])
 
+    def test_dash_parser_collects_whole_file_subtitles_and_skips_segmented_text(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const text = `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT10S">
+  <BaseURL>cdn/</BaseURL>
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate timescale="1000" initialization="v/init.mp4" media="v/$Number$.m4s" duration="2000" startNumber="1"/>
+      <Representation id="v" bandwidth="900000" width="640" height="360"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="text" mimeType="text/vtt" lang="zh">
+      <Representation id="sub-zh"><BaseURL>subs/zh.vtt</BaseURL></Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="text" mimeType="application/mp4" codecs="stpp" lang="en">
+      <SegmentTemplate timescale="1000" initialization="t/init.mp4" media="t/$Number$.m4s" duration="2000"/>
+      <Representation id="sub-en"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`;
+const p = e.parseDashManifest(text, 'https://example.test/path/manifest.mpd');
+console.log(JSON.stringify({
+  subtitles: p.subtitles,
+  trackIds: p.tracks.map((item) => item.id),
+  captureTrackIds: e.dashCaptureIndex(p).tracks.map((item) => item.id)
+}));
+"""
+        result = self.run_node(source)
+        whole_file, segmented = result["subtitles"]
+        self.assertEqual("https://example.test/path/cdn/subs/zh.vtt", whole_file["url"])
+        self.assertEqual("zh", whole_file["language"])
+        self.assertFalse(whole_file["segmented"])
+        # Segmented text needs an stpp/wvtt extractor we do not have; it must be reported, not guessed at.
+        self.assertTrue(segmented["segmented"])
+        self.assertEqual("", segmented["url"])
+        # Text adaptation sets must never end up as downloadable media tracks.
+        self.assertEqual(["v"], result["trackIds"])
+        self.assertEqual(["v"], result["captureTrackIds"])
+
     def test_dash_parser_detects_drm(self) -> None:
         source = r"""
 const e = require('./extension/media-engine.js');
@@ -295,6 +334,81 @@ console.log(JSON.stringify(e.missingTimeline(segments, new Set([10, 13, 15]))));
         self.assertEqual(2, len(result))
         self.assertEqual({"sequenceFrom": 11, "sequenceTo": 12, "startSeconds": 4, "endSeconds": 12, "count": 2}, result[0])
         self.assertEqual(14, result[1]["sequenceFrom"])
+
+    def test_missing_timeline_excludes_skippable_sequences(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const segments = Array.from({length: 5}, (_, i) => ({sequence: i, startSeconds:i*4, endSeconds:(i+1)*4}));
+console.log(JSON.stringify(e.missingTimeline(segments, new Set([0, 2, 4]), new Set([1]))));
+"""
+        result = self.run_node(source)
+        self.assertEqual(1, len(result))
+        self.assertEqual(3, result[0]["sequenceFrom"])
+
+    def test_transport_timestamp_continuity_assessment(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+function writePts(bytes, offset, pts) {
+  bytes[offset] = 0x20 | (((pts / 0x40000000) & 7) << 1) | 1;
+  bytes[offset + 1] = (pts >>> 22) & 0xff;
+  bytes[offset + 2] = (((pts >>> 15) & 0x7f) << 1) | 1;
+  bytes[offset + 3] = (pts >>> 7) & 0xff;
+  bytes[offset + 4] = ((pts & 0x7f) << 1) | 1;
+}
+function tsWithPts(pts) {
+  const packet = new Uint8Array(188);
+  packet[0] = 0x47;
+  packet[1] = 0x41; // payload start, pid 0x0100 high nibble-ish
+  packet[2] = 0x00;
+  packet[3] = 0x10;
+  packet[4] = 0x00; packet[5] = 0x00; packet[6] = 0x01; packet[7] = 0xe0;
+  packet[8] = 0x00; packet[9] = 0x00;
+  packet[10] = 0x80; packet[11] = 0x80; packet[12] = 0x05;
+  writePts(packet, 13, pts);
+  const out = new Uint8Array(188 * 3);
+  out.set(packet, 0);
+  out.set(packet, 188);
+  out.set(packet, 376);
+  return out;
+}
+const prev = e.transportTimestamps(tsWithPts(90_000 * 10));
+const nextClose = e.transportTimestamps(tsWithPts(90_000 * 10 + 3_000));
+const nextGap = e.transportTimestamps(tsWithPts(90_000 * 14));
+const skippable = e.assessSkippedSegmentContinuity({
+  previousLastPts: prev.lastPts, nextFirstPts: nextClose.firstPts, expectedDurationSeconds: 4
+});
+const needed = e.assessSkippedSegmentContinuity({
+  previousLastPts: prev.lastPts, nextFirstPts: nextGap.firstPts, expectedDurationSeconds: 4
+});
+console.log(JSON.stringify({ prevOk: prev.ok, skippable, needed }));
+"""
+        result = self.run_node(source)
+        self.assertTrue(result["prevOk"])
+        self.assertEqual("skippable", result["skippable"]["status"])
+        self.assertEqual("needed", result["needed"]["status"])
+
+    def test_adjacent_segment_continuity_detects_timeline_shift(self) -> None:
+        source = r"""
+const e = require('./extension/media-engine.js');
+const ok = e.assessAdjacentSegmentContinuity({
+  previousLastPts: 90_000 * 10, nextFirstPts: 90_000 * 10 + 3_000, previousDurationSeconds: 4
+});
+const reset = e.assessAdjacentSegmentContinuity({
+  previousLastPts: 90_000 * 100, nextFirstPts: 90_000 * 2, previousDurationSeconds: 4
+});
+const jump = e.assessAdjacentSegmentContinuity({
+  previousLastPts: 90_000 * 10, nextFirstPts: 90_000 * 40, previousDurationSeconds: 4
+});
+const marked = e.assessAdjacentSegmentContinuity({
+  previousLastPts: 90_000 * 10, nextFirstPts: 90_000 * 2, previousDurationSeconds: 4, playlistDiscontinuity: true
+});
+console.log(JSON.stringify({ ok, reset, jump, marked }));
+"""
+        result = self.run_node(source)
+        self.assertEqual("ok", result["ok"]["status"])
+        self.assertEqual("shifted", result["reset"]["status"])
+        self.assertEqual("shifted", result["jump"]["status"])
+        self.assertEqual("ok", result["marked"]["status"])
 
     def test_segment_lookup_separates_query_only_urls_and_refuses_other_qualities(self) -> None:
         source = r"""

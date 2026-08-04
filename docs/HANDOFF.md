@@ -1,5 +1,50 @@
 # Web Keeper 交接文档（Handoff）
 
+## 0.4.0 – 0.4.6 旧库导入、抓取加速与时间轴判定（2026-08-04）
+
+这一段是补记：0.4.0–0.4.6 的实现先于文档完成，本节按代码实际行为回填。常量都在 `extension/download.js` 顶部，判定逻辑在 `extension/media-engine.js`。
+
+### 0.4.0 导入旧 `data/captures`
+
+产品行为见 §4.2.4，这里只补实现细节：
+
+- 按钮由 `showTaskList` 动态渲染（id `importLegacy`，空列表时 `importLegacyEmpty`），`collectLegacyVariants` 递归识别 captures 根 / 作品夹 / 清晰度夹；只选清晰度夹时会要求输入作品名。
+- `buildSyntheticLegacyPlaylist` 按磁盘上的 `.ts` 文件名合成播放列表，`rewriteLegacyPlaylistKey` 把 `#EXT-X-KEY` 指向内部伪 URL（`https://legacy.local/aes-key/…`），由 `cacheLegacyAesKey` 把同目录 `file.key` 预置进解密缓存 —— 因此导入过程完全离线，不会向任何站点发请求。
+- 导入阶段就跳过无效的极小文件（同 `MIN_SEGMENT_BYTES`）。
+
+### 0.4.1 – 0.4.2 抓取加速
+
+- 「播放加速」先试网页播放器的 `playbackRate`（2/4/8x，自动静音）；站点禁用或限速时自动回退到定时快进（`startSeekBoost` / `stepSeekForward`），即用户最早提出的「每秒按一次右方向键」思路，但直接改 `currentTime` 并附带派发方向键事件。
+- 快进参数可调并持久化在任务状态：`captureSeekIntervalSec`（0.25–30 秒，默认 1）、`captureSeekStepSeconds`（1–120 秒，默认 10），由 `normalizedSeekBoostSettings` 夹取范围。改动即时重启快进；暂停停止、继续恢复。
+
+### 0.4.3 卡住强提示与补洞反馈
+
+- `checkProgressStall` 每 5 秒轮询，`done`/`bytes` 超过 `STALL_WARN_MS`（45 秒）没变就把提示条转红并弹一次 alert（`stallAlertShown` 保证同一轮只弹一次）。网页辅助会附带网页播放位置、是否在缺口附近、下一处缺口时间。覆盖跟播、快进、智能补全和直接下载。
+- 智能补全增加当前缺口高亮（`smartFillActiveRange`）、一段补完提示下一处缺口、播放器偏离目标超过 `SMART_FILL_SEEK_SKEW_SECONDS`（20 秒）告警。
+
+### 0.4.4 – 0.4.6 极小分片与时间轴判定（本轮最实质的改动）
+
+- `MIN_SEGMENT_BYTES = 188`（一个 MPEG-TS 包）。小于此的一律不算已保存。
+- 关键判断不是「极小就永远缺」，而是**跳过它之后前后接不接得上**：`classifySkippedSequence` 取前一片尾 + 后一片头各 `TS_TIMESTAMP_SAMPLE_BYTES`（512 KB），用 `transportTimestamps` 扫 PTS（没有则 PCR），交给 `assessSkippedSegmentContinuity` 判定：
+  - 间隔 ≤ `max(0.35, 时长×0.25)` → `skippable`，这一片本来就没有媒体，不再重试也不参与合并；
+  - 间隔 ≈ 播放列表时长（±`max(0.75, 时长×0.4)`）或明显偏大 → `needed`，真缺片；
+  - 读不到时间戳、缺邻居、跨 `#EXT-X-DISCONTINUITY` → `unknown`，**保守当缺片**。
+- `assessAdjacentSegmentContinuity` 用同样的采样监测任务中途的时间轴漂移：回跳 < −1.5 秒判 `PTS_RESET_OR_JUMP_BACK`，前跳超过 `max(时长×1.8, 时长+2.5, 3)` 判 `PTS_FORWARD_JUMP`；播放列表自带断点不算异常。
+- 发现漂移后**不阻塞**：`adjustTimelineShiftAndContinue` 在接缝序号记 `timelineBreaks`、作废旧的可跳过结论、保留已下分片并继续下载，合并阶段由 mux.js（`keepOriginalTimestamps: false`）重排时间戳。接缝处仍可能有轻微跳变，这不是 ffmpeg 级对齐。
+- 暂停超过 `LONG_PAUSE_MS`（5 分钟）后恢复会走 `prepareTimelineAfterIdle`，先作废旧结论再按当前分片重判，避免用过期结论。
+- `missingTimeline` 增加第三个参数排除 skippable；缺片面板显示「已确认 N 个可跳过」；合并的 `missing` 计算排除 skippable，完成提示说明跳过了几个。
+- 全程不使用 ffmpeg、不新增权限、不做整片解码。
+
+### 这一段的验证边界
+
+- `media-engine.js` 侧的判定（`assessSkippedSegmentContinuity`、`assessAdjacentSegmentContinuity`、`missingTimeline` 排除 skippable）**有真实 node 行为测试**。
+- `download.js` 侧的导入、快进、卡住提示**只有契约断言**（函数名/元素 id 存在），因为依赖 `chrome.scripting` 和完整 DOM，只能在真实浏览器里验。
+- 真实站点仍未验收。特别是「暂停很久后时间轴变化」这条，需要在直播或会过期的片源上实测。
+
+### 顺带修正（本次补文档时）
+
+- `background.js` 的 `SCRIPT_VERSION` 之前一直停在 `0.3.9`，写进 storage 的 `engineVersion` 是过期值（popup 显示的是 manifest 版本，所以用户看到的是对的）。已改为跟随 manifest，并加测试把 manifest 版本、`SCRIPT_VERSION`、两个 README 的版本号和发布包名钉在一起，防止再次漂移。
+
 ## 0.3.9 Capture 直取播放器数据 + DASH 辅助抓取（2026-08-04）
 
 ### 直取播放器已经收到的数据（本轮最重要的改动）
@@ -11,6 +56,18 @@
 - 缓冲区留在页面里，所以任务页短暂关闭期间播放器收到的数据仍然在（只要标签页还在）。任务完成或从列表移除时会调用 `stop()` 还原 `fetch`/XHR 并清空缓冲。
 - 页面脚本全程 try/catch，任何异常都直接放行原始请求；只有用户明确对该标签页选择了辅助抓取才会注入。
 - **不使用 `chrome.debugger`**，因此不会出现调试横幅，也没有新增权限（`scripting` + `<all_urls>` 已有）。
+
+### 跨标签页继续、播放加速与 DASH 字幕
+
+- `matchesCandidate` 以前两条分支都绑定 tabId（`candidateId` 本身就是 `tabId:product:resolution`），所以未完成的任务在第二天重开视频（新标签页）后收不到任何事件，会一直停在“等待网页继续播放”。现在改成按 product + 页面 URL 匹配，不再看 tabId；匹配到新标签页时把 `candidate.tabId` 切过去并重新注入页面钩子（否则数据直取会打到不存在的旧标签页）。页面 URL 用于区分同一站点下 product 推导相同、实际是不同视频的情况。
+- 任务页新增“播放加速”（1/2/4/8x）：在原网页把 `video.playbackRate` 调高并静音，让播放器提前请求后续分片。选择保存在 `state.captureSpeed`，恢复任务和每次智能补全 seek 之后都会重新施加（播放器常在 seek 后重置速率）。站点限制速率时会如实报出实际值。这是比原来 `auto-seek-right.ahk` 盲按方向键更稳的加速方式，缺口仍由智能补全兜底。
+- `parseDashManifest` 现在收集 MPD 里的字幕：整文件型（BaseURL 指向 .vtt 等）进 `manifest.subtitles` 并合入 `candidate.subtitles`，复用既有字幕保存路径；分片式文本轨（stpp/wvtt）需要额外提取器，明确跳过并记日志，不做猜测。文本 AdaptationSet 不再有机会进入可下载媒体轨列表。
+
+### 失败重试与暂停语义
+
+- 保存失败的分片以前只把 `state.failed` 加一就丢掉，文案却写着“再次播放到这里时会重试”，承诺大于实现。现在失败的分片会进 `pendingCaptureSegments`，在播放列表/清单刷新、下一次成功保存或任务恢复时自动重试，每个 URL 最多 3 次（`MAX_CAPTURE_RETRIES`），超出后改提示可用智能补全，不再无限重试。成功保存会清掉该 URL 的计数。
+- 暂停不再被记成失败。暂停会中止在途请求，抛出的是“下载已暂停”，以前会走进同一个 catch，导致每次暂停都 `failed+1` 并弹一条像出错的提示。现在这种情况只把该分片放回待重试队列，不计数也不报错。
+- HLS 和 DASH 两条 capture 路径在恢复时都会重放待重试队列。
 
 ### 直播与滚动窗口
 
@@ -27,7 +84,7 @@
 - `saveDashSegment` / `saveDashInitialization` 与 HLS 一样支持原网页会话回落和浏览器缓存优先（统一为 `fetchMediaBytes`）。
 - background 的无扩展名分片识别不再只看 HLS 上下文：manifest 请求同样标记该标签页，候选的 `manifestUrl(s)` 也算作流媒体上下文，manifest 事件也会进入 30 分钟请求队列。
 - 顺带修正：辅助抓取任务点「检查并生成视频」以前会调用 `runDirect()` 触发一次完整直接下载，现在直接合并已抓到的内容。`reconcileSaved` 也能按 `dash` / `hls-cmaf` 记录找到对应轨道目录，重开任务不再先显示 0。
-- 自动化测试 39 项通过，新增 DASH 索引与滚动窗口累积测试、页面直取拦截器行为测试（播放器仍能读到自己的响应、播放列表不缓冲、取走一次即释放、stop 后还原）。真实站点验收仍未做。
+- 自动化测试 41 项通过，新增 DASH 索引与滚动窗口累积测试、MPD 字幕解析测试、页面直取拦截器行为测试（播放器仍能读到自己的响应、播放列表不缓冲、取走一次即释放、stop 后还原）。真实站点验收仍未做。
 
 ## 0.3.8 Capture 清晰度跟随与会话内重试（2026-08-04）
 
@@ -272,6 +329,7 @@ extension/  →  http://127.0.0.1:17888  →  data/ / archives/ / outputs/
 
 - 浏览器和下载任务页可能需要保持开启，界面必须明确提示。
 - 不把现有 113GB captures 自动搬进浏览器存储；旧数据只读索引策略保持不变。
+- **用户追问（2026-08-04）**：希望纯扩展也能继续老的 `data/captures` 下载。已实现下载中心「导入旧捕获目录」（见 §4.2.4）：显式选目录 → 解密导入任务空间 → 可生成视频；缺片时可改用网页辅助继续（智能补全/播放加速/字幕与新任务共用）。
 - File System Access 目录授权可能失效，任务必须能停在“等待重新授权”而不是丢失进度。
 - 纯扩展无法处理 DRM、部分特殊鉴权或复杂转码时，要给出可诊断原因，不能直接归因于“需要 Helper”。
 
@@ -338,6 +396,19 @@ Merge 按钮旁应直接给建议：`可 strict` / `建议先补洞` / `仅可 s
 4. 失败时展示 ffmpeg 错误摘要，可重试  
 5. 重复点击防抖（避免像本次一样生成两份几乎相同的 13GB+ 文件）
 
+### 4.2.4 纯扩展兼容旧 `data/captures`（已实现）
+
+下载中心提供「导入旧捕获目录」：
+
+1. 用户用 File System Access 选择 `data/captures`、作品夹或清晰度夹（显式授权，不静默扫盘）  
+2. 读取 `first.m3u8` / `file.key` / `*.ts`（及可选 `subtitles/`）  
+3. 解密并规范化写入扩展任务空间（`source=legacy-import`），建立缺片时间轴  
+4. 齐了可直接「检查并生成视频」；有缺口可「改用网页辅助」→ 智能补全 / 播放加速继续  
+5. 字幕：导入本地字幕文件；也可在绑定原网页后走扩展字幕保存  
+6. **不**自动迁移/删除旧树；重复导入同一作品清晰度会打开已有任务
+
+与新能力兼容：缺片时间轴、完成提示、播放加速、智能补全、字幕保存均挂在同一任务模型上（补洞需回到原网页并切换网页辅助）。
+
 ### 4.2.3 自定义下载 / 捕获目录（用户明确要求）
 
 现状：主要靠启动参数 `--data-dir` / `--output-dir` / `--archive-dir`，扩展和 Dashboard 几乎不能改，普通用户也不知道。
@@ -360,7 +431,7 @@ Merge 按钮旁应直接给建议：`可 strict` / `建议先补洞` / `仅可 s
 - 缺片列表转换为用户可读区间：`缺失 01:23:10 – 01:24:02（v_006964–v_006989）`
 - Dashboard/扩展提供「复制时间点 / 打开说明」；有 playlist 时优先精确，没有则按平均时长估算并标注「估算」
 
-**补洞加速（已验证的用户技巧）**：部分站点播放器「方向右键 ≈ 快进 10s」。每秒按一次可迫使播放器持续请求后续分片，Capture 落盘明显更快。  
+**补洞加速（已验证的用户技巧，0.4.1–0.4.2 已产品化）**：部分站点播放器「方向右键 ≈ 快进 10s」。每秒按一次可迫使播放器持续请求后续分片，Capture 落盘明显更快。现在这条已经做进任务页的「播放加速」：优先用播放器倍速，站点限速时回退为定时快进，频率和步长可调，默认就是每 1 秒跳 10 秒。下面两个脚本因此只作为历史参考保留。  
 
 - 临时脚本已放：`scripts/auto-seek-right.ahk`、`scripts/auto-seek-userscript.js`（F8 开关）  
 - 产品化方向：扩展「补洞模式」按 missing timeline 精确 seek，而不是盲目 +10s

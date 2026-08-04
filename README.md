@@ -1,6 +1,6 @@
 ﻿# Web Keeper
 
-> Current extension development version: **0.3.9**
+> Current extension development version: **0.4.6**
 
 Web Keeper is a browser-first HLS discovery, direct-download, and assisted-capture tool. The main video flow now runs entirely inside the extension; the legacy Python Dashboard remains available for existing captures, native ffmpeg workflows, and Archive jobs.
 
@@ -95,11 +95,21 @@ Once assisted saving starts, Web Keeper keeps the media bytes the player already
 
 Live streams (a live HLS playlist or a `type="dynamic"` MPD) never finalise on their own; they keep saving until you choose Check and create video.
 
+Assisted tasks can be sped up from the task page. **Playback speed** first tries the page player's own `playbackRate` (2x, 4x, 8x, muted); when a site refuses or caps it, capture falls back to stepping the player forward on a timer. That fallback is configurable: how often to step (0.25–30 s, default 1 s) and how far each step goes (1–120 s, default 10 s). Pausing stops it and continuing restores it.
+
+If saved progress does not move for about 45 seconds, the notice turns red and an alert appears once per stall, reporting the player's current position, whether it is near a gap, and roughly where the next gap starts. Gap filling highlights the range it is working on, warns when the player ends up more than ~20 s away from the target, and reports the next gap when a range is done.
+
+Segments smaller than 188 bytes (one MPEG-TS packet) are never counted as saved. Web Keeper then reads the timestamps of the neighbouring saved segments — a 512 KB sample each, no decoding and no ffmpeg — and decides: if the neighbours already join up, the tiny segment carried no media and is marked skippable, so it is neither retried nor merged; if the gap matches the playlist duration, real content is missing and it stays a gap; anything ambiguous stays a gap as well. Merging skips confirmed skippable items and says how many it skipped.
+
+The same timestamp check watches for a timeline that shifts mid-task, which happens when a long pause is followed by a re-encoded or re-signed source. Web Keeper records a break at that seam, drops stale skippable verdicts, keeps the downloaded segments, and carries on; the merge step re-times the pieces into one file. Seams may still be slightly rough — this is not ffmpeg-grade alignment.
+
+Old `data/captures` folders can be brought into the extension with **Import legacy capture** in the download centre. Pick the captures root, a work folder, or a single quality folder; Web Keeper builds a task from the files already on disk, decrypts them with the neighbouring `file.key`, skips invalid tiny files, and leaves the original folder untouched. What is missing can then be filled with assisted capture as usual.
+
 Capture is still a stream-oriented fallback, not a general network-response recorder. Multi-period DASH and complex separate-track streams still require further validation or adaptation.
 
 ## Local Release Package
 
-The development package is `dist/Web-Keeper-0.3.9.zip`. Extract it, enable Developer mode in Edge/Chrome, and choose **Load unpacked**. The archive excludes the experimental Helper and does not require the Python service. The recommended destination uses the browser Downloads API, so it can save to the normal Downloads folder without granting that folder through the File System Access picker.
+The development package is `dist/Web-Keeper-0.4.6.zip`. Extract it, enable Developer mode in Edge/Chrome, and choose **Load unpacked**. The archive excludes the experimental Helper and does not require the Python service. The recommended destination uses the browser Downloads API, so it can save to the normal Downloads folder without granting that folder through the File System Access picker.
 
 After changing extension files, reload the extension in Edge/Chrome.
 

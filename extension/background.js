@@ -1,4 +1,4 @@
-const SCRIPT_VERSION = "web-keeper-extension-0.3.9";
+const SCRIPT_VERSION = "web-keeper-extension-0.4.6";
 const CANDIDATES_KEY = "wkCandidates";
 const JOBS_KEY = "wkJobs";
 const MEDIA_EVENTS_KEY = "wkMediaEvents";

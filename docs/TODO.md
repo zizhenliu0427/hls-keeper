@@ -47,11 +47,21 @@
   - [x] 无扩展名 HLS playlist/segment 按 Content-Type 和近期 HLS 上下文识别  
   - [x] Capture 跟随播放器实际清晰度：保存前可切换 variant，保存后锁定并提示，不混合分辨率  
   - [x] 无法定位的分片进入待重试队列，在播放列表刷新或下次成功保存后重放  
+  - [x] 保存失败的分片自动重试（每 URL 上限 3 次），暂停不再计为失败也不再弹错误  
+  - [x] 未完成的任务在同一视频重开为新标签页后仍可继续；自动跟随新标签页  
+  - [x] 播放加速（1/2/4/8x 静音快放）作为比盲目 seek 更稳的抓取加速方式  
+  - [x] DASH 整文件字幕并入字幕保存；分片式文本轨明确跳过  
   - [x] 任务页请求失败时改在原网页会话内取分片（Referer/Origin/Cookie 随页面），并优先复用浏览器缓存  
   - [x] DASH Capture：按 MPD 索引全部 Representation，锁定播放器实际使用的音视频轨并合并成 CMAF MP4  
   - [x] Capture 直取播放器已收到的响应体（页面内 MAIN world 拦截 fetch/XHR，上限 96 MB），不再必然重新请求  
   - [x] 直播不再自动合成；DASH 动态清单刷新按累积合并，已保存分片位置不变  
+  - [x] 导入旧 `data/captures`（用户显式选目录，合成播放列表 + 本地 key 解密，不改动原目录）  
+  - [x] 抓取加速：播放器倍速优先，站点限速时回退为可调频率/步长的定时快进  
+  - [x] 进度卡住 45 秒强提示；智能补全高亮当前缺口、提示下一缺口、校验播放器偏离  
+  - [x] 极小分片按前后 PTS/PCR 连贯性分流：连贯→可跳过不重试，空档≈时长→真缺片，判不准→保守当缺片  
+  - [x] 任务中途时间轴漂移检测：记断点、作废旧结论、保留已下分片并继续，合并时重排时间戳  
   - [ ] 多 Period DASH 与复杂独立音轨的 Capture 适配  
+  - [ ] 时间轴漂移与可跳过判定尚未在真实直播/过期片源上验收  
   - 浏览器内完成常见 HLS remux/mux，复杂转码不作为 MVP 前置条件  
   - 在真实目标站点记录 401/403/404/429、响应大小、Token 变化和播放器状态，区分 API 边界与抓取策略问题  
   - 未安装 Helper 也能完成核心流程
@@ -96,6 +106,13 @@
   - 不仅依赖命令行 `--data-dir` / `--output-dir` / `--archive-dir`  
   - 改目录默认不影响已下载数据（不自动迁移）；文档说明如何手动搬家  
   - 与 #13 输出路径展示、#1 设置页一起做
+
+- [x] **15. 纯扩展导入/挂载旧 `data/captures`（用户要求兼容）**  
+  - 下载中心「导入旧捕获」：用户授权目录后扫描 `.ts` / `file.key` / `first.m3u8`  
+  - 建成扩展任务：解密规范化到任务空间、缺片可续传、可合并导出  
+  - 默认不自动全盘扫描；不搬迁、不删除旧树  
+  - 导入后可改用网页辅助：智能补全 / 播放加速 / 字幕保存共用同一任务  
+  - 详见 `HANDOFF.md` §4.2.4
 
 - [ ] **11. Dashboard 网络流水（类 DevTools Network）**  
   - 主界面增加 Network/下载流水面板，不用开浏览器 F12 也能看清「正在下哪些」  
@@ -151,6 +168,7 @@
 
 - [x] Capture 移除 `burst-ahead`，按任务单队列跟随播放器实际请求  
 - [ ] Capture 严格会话站点适配：已能直取播放器收到的数据，覆盖一次性 URL 与私有 token；仍需真实站点验收，且注入前已经播过的分片取不到  
+- [x] 版本号一致性：manifest / `SCRIPT_VERSION` / 两个 README 的版本与发布包名已由测试钉住  
 - [ ] `state` 持久化勿再做成频繁全量巨型 JSON（可考虑 sqlite / 分文件）  
 - [ ] `/api/status` 保持轻量；全量扫盘仅手动或低频缓存  
 - [ ] Merge 与 Direct download 的产品文案/引导做清楚  
@@ -166,9 +184,10 @@
 3. `missing-timeline`：缺片时间轴 + 完成/缺片主动提示  
 4. `merge-ux`：Merge 反馈/进度/输出路径/打开文件夹  
 5. `custom-dirs`：自定义捕获/输出/Archive 目录  
-6. `network-panel`：Dashboard 类 DevTools Network 流水  
-7. `i18n-zh`：中文  
-8. `archive-generic`：通用批量下载  
-9. `archive-fanbox` / `archive-confluence` / `archive-linear`  
-10. `extension-release`：纯扩展打包与 GitHub Release  
-11. `optional-python-helper`：能力闸门通过后再做纯 Python Helper 与跨平台适配
+6. `legacy-import`：纯扩展导入旧 `data/captures` 续传  
+7. `network-panel`：Dashboard 类 DevTools Network 流水  
+8. `i18n-zh`：中文  
+9. `archive-generic`：通用批量下载  
+10. `archive-fanbox` / `archive-confluence` / `archive-linear`  
+11. `extension-release`：纯扩展打包与 GitHub Release  
+12. `optional-python-helper`：能力闸门通过后再做纯 Python Helper 与跨平台适配

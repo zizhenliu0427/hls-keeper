@@ -32,6 +32,8 @@ let lastCaptureRefreshAt = 0;
 let lastAdoptAttemptAt = 0;
 let lastDashSwitchAt = 0;
 let lastHookInjectionAt = 0;
+const MAX_CAPTURE_RETRIES = 3;
+const captureRetryCounts = new Map();
 let pageBufferWaitMs = PAGE_BUFFER_WAIT_COLD_MS;
 let pageBufferMisses = 0;
 let pageBufferGaveUp = new Set();
@@ -46,6 +48,21 @@ let directConcurrency = 4;
 let saveDestination = "browser-downloads";
 let speedSampleAt = Date.now();
 let speedSampleBytes = 0;
+let seekBoostTimer = null;
+let progressWatchTimer = null;
+let lastProgressAt = Date.now();
+let lastProgressMark = { done: 0, bytes: 0 };
+let stallAlertShown = false;
+let smartFillActiveRange = null;
+const SEEK_BOOST_STEP_SECONDS = 10;
+const SEEK_BOOST_INTERVAL_MS = 1000;
+const MIN_SEGMENT_BYTES = 188;
+const STALL_WARN_MS = 45000;
+const SMART_FILL_SEEK_SKEW_SECONDS = 20;
+const TS_TIMESTAMP_SAMPLE_BYTES = 512 * 1024;
+const LONG_PAUSE_MS = 5 * 60 * 1000;
+let skippableClassifyRunning = false;
+let timelineShiftAlertShown = false;
 
 function updateTransferSpeed() {
   const now = Date.now();
@@ -224,8 +241,105 @@ function statusLabel(status) {
   })[status] || status || t("statusPreparing", null, "准备中");
 }
 
+function noteDownloadProgress() {
+  if (!state) return;
+  const done = Number(state.done || 0);
+  const bytes = Number(state.bytes || 0);
+  if (done === lastProgressMark.done && bytes === lastProgressMark.bytes) return;
+  lastProgressMark = { done, bytes };
+  lastProgressAt = Date.now();
+  stallAlertShown = false;
+  if (state.stalled) state.stalled = false;
+}
+
+function stopProgressWatchdog() {
+  if (progressWatchTimer) {
+    clearInterval(progressWatchTimer);
+    progressWatchTimer = null;
+  }
+}
+
+function startProgressWatchdog() {
+  stopProgressWatchdog();
+  lastProgressMark = { done: Number(state?.done || 0), bytes: Number(state?.bytes || 0) };
+  lastProgressAt = Date.now();
+  stallAlertShown = false;
+  if (state) state.stalled = false;
+  progressWatchTimer = setInterval(() => { void checkProgressStall(); }, 5000);
+}
+
+async function inspectPlayerTime() {
+  const tabId = Number(candidate?.tabId);
+  if (!(tabId >= 0)) return null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const videos = [...document.querySelectorAll("video")].filter((item) => item.duration || item.readyState || item.clientWidth);
+        const video = videos.sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+        if (!video) return null;
+        return { currentTime: Number(video.currentTime || 0), duration: Number.isFinite(video.duration) ? video.duration : 0, paused: Boolean(video.paused) };
+      }
+    });
+    return (results || []).map((item) => item?.result).find(Boolean) || null;
+  } catch {
+    return null;
+  }
+}
+
+function nearestMissingHint(playerTime = null) {
+  const ranges = state?.missingRanges || [];
+  if (!ranges.length) return "";
+  if (playerTime == null || !Number.isFinite(playerTime)) {
+    const first = ranges[0];
+    return t("stallNextMissingHint", [formatTime(first.startSeconds), formatTime(first.endSeconds)], `下一处缺口约在 ${formatTime(first.startSeconds)} – ${formatTime(first.endSeconds)}。`);
+  }
+  let best = ranges[0];
+  let bestDist = Math.abs(Number(best.startSeconds || 0) - playerTime);
+  for (const range of ranges) {
+    const start = Number(range.startSeconds || 0);
+    const end = Number(range.endSeconds || start);
+    const dist = playerTime < start ? start - playerTime : playerTime > end ? playerTime - end : 0;
+    if (dist < bestDist) {
+      best = range;
+      bestDist = dist;
+    }
+  }
+  if (bestDist <= SMART_FILL_SEEK_SKEW_SECONDS) {
+    return t("stallAtMissingHint", [formatTime(best.startSeconds), formatTime(best.endSeconds)], `播放器大致在缺口 ${formatTime(best.startSeconds)} – ${formatTime(best.endSeconds)} 附近。`);
+  }
+  return t("stallFarFromMissingHint", [formatTime(playerTime), formatTime(best.startSeconds), formatTime(best.endSeconds), Math.round(bestDist)], `播放器约在 ${formatTime(playerTime)}，距最近缺口 ${formatTime(best.startSeconds)} – ${formatTime(best.endSeconds)} 约偏 ${Math.round(bestDist)} 秒。`);
+}
+
+async function checkProgressStall() {
+  if (!state || paused) return;
+  const watching = ["downloading", "capturing", "waiting"].includes(state.status) || smartFillRunning;
+  if (!watching) return;
+  if (state.status === "waiting" && state.mode === "direct" && !state.isLive) return;
+  if (Date.now() - lastProgressAt < STALL_WARN_MS) return;
+  const idleSec = Math.round((Date.now() - lastProgressAt) / 1000);
+  let player = null;
+  if (state.mode === "browser-assisted" || smartFillRunning) player = await inspectPlayerTime();
+  const hint = nearestMissingHint(player?.currentTime);
+  const playerPart = player
+    ? t("stallPlayerTimePart", [formatTime(player.currentTime), player.paused ? t("stallPlayerPaused", null, "已暂停") : t("stallPlayerPlaying", null, "播放中")], `网页进度约 ${formatTime(player.currentTime)}（${player.paused ? "已暂停" : "播放中"}）。`)
+    : "";
+  state.stalled = true;
+  state.message = smartFillRunning
+    ? t("stallSmartFillAlert", [idleSec, playerPart, hint], `进度已约 ${idleSec} 秒没有增加。${playerPart}${hint}请确认网页仍在加载，或手动播放缺口后再继续智能补全。`)
+    : state.mode === "direct"
+      ? t("stallDirectAlert", idleSec, `进度已约 ${idleSec} 秒没有增加。可稍后继续，或改用网页辅助。`)
+      : t("stallCaptureAlert", [idleSec, playerPart, hint], `进度已约 ${idleSec} 秒没有增加。${playerPart}${hint}请回到网页播放、开启自动快进，或使用智能补全。`);
+  await mirrorJob();
+  if (!stallAlertShown) {
+    stallAlertShown = true;
+    alert(state.message);
+  }
+}
+
 async function mirrorJob() {
   updateTransferSpeed();
+  noteDownloadProgress();
   state.updatedAt = Date.now();
   await dbPut("states", state);
   const stored = await chrome.storage.local.get({ [JOBS_KEY]: [] });
@@ -250,7 +364,11 @@ function render() {
   $("taskView").hidden = false;
   $("listView").hidden = true;
   $("title").textContent = state.title || state.product || t("downloadTask", null, "视频下载");
-  $("subtitle").textContent = `${state.resolution || t("automaticQuality", null, "自动清晰度")} · ${state.mode === "direct" ? t("downloadMethodDirect", null, "直接下载") : t("downloadMethodAssisted", null, "网页辅助")}`;
+  $("subtitle").textContent = `${state.resolution || t("automaticQuality", null, "自动清晰度")} · ${
+    state.source === "legacy-import"
+      ? t("downloadMethodLegacyImport", null, "旧捕获导入")
+      : (state.mode === "direct" ? t("downloadMethodDirect", null, "直接下载") : t("downloadMethodAssisted", null, "网页辅助"))
+  }`;
   $("status").textContent = statusLabel(state.status);
   $("status").className = `pill ${state.status === "complete" ? "ok" : state.status === "error" ? "bad" : ""}`;
   const byteProgress = state.progressUnit === "bytes";
@@ -262,23 +380,51 @@ function render() {
     ? t("byteProgress", [formatBytes(done), total ? formatBytes(total) : "?"], `${formatBytes(done)} / ${total ? formatBytes(total) : "?"}`)
     : total ? t("progressCount", [done, total, Math.round(done / total * 100)], `${done}/${total}（${Math.round(done / total * 100)}%）`) : t("itemsSavedCount", done, `已完成 ${done} 项`);
   $("saved").textContent = byteProgress ? (state.status === "complete" ? "1" : "0") : String(done);
-  $("missing").textContent = byteProgress ? (state.status === "complete" ? "0" : "1") : total ? String(Math.max(total - done, 0)) : "—";
+  const missingCount = byteProgress
+    ? (state.status === "complete" ? 0 : 1)
+    : (Array.isArray(state.missingRanges) ? Number(state.missing || 0) : (total ? Math.max(total - done, 0) : null));
+  $("missing").textContent = missingCount == null ? "—" : String(missingCount);
   $("bytes").textContent = formatBytes(state.bytes);
   $("speed").textContent = ["downloading", "capturing"].includes(state.status) ? `${Number(state.speedMbps || 0).toFixed(2)} MB/s` : "—";
   $("notice").textContent = state.message || t("chooseFolderShort", null, "请选择保存位置。");
-  $("notice").className = `notice ${state.status === "error" ? "bad" : ""}`;
+  $("notice").className = `notice ${state.status === "error" || state.stalled ? "bad" : ""}`;
+  if (state.stalled) $("status").className = "pill bad";
   const hasHandle = Boolean(rootHandle);
   $("choose").hidden = saveDestination === "browser-downloads" || hasHandle || ["downloading", "capturing", "merging", "exporting"].includes(state.status);
   $("choose").textContent = state.done ? t("chooseFolderAndContinue", null, "重新选择位置并继续") : t("chooseFolderAndStart", null, "选择位置并开始");
   $("resume").hidden = !hasHandle || !["paused", "error", "ready", "waiting"].includes(state.status);
   $("pause").hidden = !["downloading", "capturing", "waiting"].includes(state.status);
   $("backToVideo").hidden = state.mode !== "browser-assisted" || !["capturing", "waiting", "paused"].includes(state.status);
-  $("switchAssisted").hidden = state.mode !== "direct" || !["error", "waiting"].includes(state.status) || !["AUTH_REQUIRED", "URL_EXPIRED", "PLAYLIST_STALLED", "NETWORK_ERROR", "SEPARATE_TRACKS"].includes(state.errorCode || "");
+  const legacyNeedsAssist = state.source === "legacy-import" && Number(state.missing || 0) > 0 && ["paused", "downloaded", "ready", "waiting"].includes(state.status);
+  $("switchAssisted").hidden = !(
+    (state.mode === "direct" && ["error", "waiting"].includes(state.status) && ["AUTH_REQUIRED", "URL_EXPIRED", "PLAYLIST_STALLED", "NETWORK_ERROR", "SEPARATE_TRACKS"].includes(state.errorCode || ""))
+    || legacyNeedsAssist
+  );
   const ranges = state.missingRanges || [];
-  $("missingPanel").hidden = !ranges.length;
-  $("missingRanges").innerHTML = ranges.slice(0, 12).map((range) => `<div class="range"><span>${escapeHtml(formatTime(range.startSeconds))} – ${escapeHtml(formatTime(range.endSeconds))}</span><span class="muted">${escapeHtml(t("missingItemsCount", range.count, `${range.count} 项`))}</span></div>`).join("")
+  const skippableCount = Number(state.skippableCount || skippableSequenceSet().size || 0);
+  const breakCount = timelineBreakSet().size;
+  $("missingPanel").hidden = !ranges.length && !skippableCount && !breakCount;
+  $("missingRanges").innerHTML = (breakCount
+    ? `<div class="muted">${escapeHtml(t("timelineBreaksNote", breakCount, `已自动标记 ${breakCount} 处时间轴断点（暂停后片源变化），下载会继续。`))}</div>`
+    : "")
+    + (skippableCount
+    ? `<div class="muted">${escapeHtml(t("skippableSegmentsNote", skippableCount, `已确认 ${skippableCount} 个空壳/可跳过分片（前后时间轴连贯，不再重试）。`))}</div>`
+    : "")
+    + ranges.slice(0, 12).map((range) => {
+      const active = smartFillActiveRange
+        && Number(range.sequenceFrom) === Number(smartFillActiveRange.sequenceFrom)
+        && Number(range.sequenceTo) === Number(smartFillActiveRange.sequenceTo);
+      return `<div class="range${active ? " active" : ""}"><span>${escapeHtml(formatTime(range.startSeconds))} – ${escapeHtml(formatTime(range.endSeconds))}${active ? ` · ${escapeHtml(t("smartFillCurrentRangeMark", null, "正在补"))}` : ""}</span><span class="muted">${escapeHtml(t("missingItemsCount", range.count, `${range.count} 项`))}</span></div>`;
+    }).join("")
     + (ranges.length > 12 ? `<div class="muted">${escapeHtml(t("moreMissingRanges", ranges.length - 12, `另有 ${ranges.length - 12} 处`))}</div>` : "");
   $("smartFill").hidden = state.mode !== "browser-assisted" || !ranges.length || !["capturing", "waiting", "paused"].includes(state.status);
+  const showSpeed = state.mode === "browser-assisted" && ["capturing", "waiting", "paused"].includes(state.status);
+  $("captureSpeedPanel").hidden = !showSpeed;
+  $("captureSpeed").value = state.captureSpeedMode === "seek" ? "seek10" : String(Number(state.captureSpeed || 1) || 1);
+  const seekSettings = normalizedSeekBoostSettings();
+  $("seekBoostPanel").hidden = !showSpeed || state.captureSpeedMode !== "seek";
+  if (!$("seekBoostInterval").matches(":focus")) $("seekBoostInterval").value = String(seekSettings.intervalSec);
+  if (!$("seekBoostStep").matches(":focus")) $("seekBoostStep").value = String(seekSettings.stepSeconds);
   $("smartFill").disabled = smartFillRunning;
   $("merge").hidden = state.providerId === "direct-file" || !hasHandle || !state.done || Boolean(state.outputName) || ["downloading", "merging"].includes(state.status);
   $("openOutput").hidden = !hasHandle || !state.outputName || state.status === "merging";
@@ -390,7 +536,36 @@ function rememberPlaylistSources(parsed) {
   knownPlaylistSources = Array.from(new Set([...knownPlaylistSources, ...discovered.filter(Boolean)])).slice(-40);
 }
 
+async function loadLocalLegacyPlaylist() {
+  if (!workDirectory || state?.source !== "legacy-import") return null;
+  try {
+    const playlistHandle = await workDirectory.getFileHandle("source.m3u8");
+    const text = await (await playlistHandle.getFile()).text();
+    const baseUrl = candidate.playlistUrl || `https://legacy.local/${encodeURIComponent(state.product)}/${encodeURIComponent(state.resolution)}/source.m3u8`;
+    const parsed = parsePlaylist(text, baseUrl);
+    if (state.legacyKeyUrl) {
+      try {
+        const keyHandle = await workDirectory.getFileHandle("file.key");
+        await cacheLegacyAesKey(await (await keyHandle.getFile()).arrayBuffer(), state.legacyKeyUrl);
+        for (const segment of parsed.segments) {
+          if (segment.key) segment.key = { ...segment.key, url: state.legacyKeyUrl };
+        }
+      } catch { /* key optional for clear segments */ }
+    }
+    return { url: baseUrl, text, parsed };
+  } catch {
+    return null;
+  }
+}
+
 async function loadMediaPlaylist() {
+  const localLegacy = await loadLocalLegacyPlaylist();
+  if (localLegacy?.parsed?.segments?.length) {
+    candidate.playlistUrl = localLegacy.url;
+    indexMediaPlaylist(localLegacy.parsed);
+    rememberPlaylistSources(localLegacy.parsed);
+    return mediaPlaylist;
+  }
   const urls = pinnedPlaylistUrl ? [pinnedPlaylistUrl] : Array.from(new Set([...(candidate.playlistUrls || []), candidate.playlistUrl].filter(Boolean)));
   if (!urls.length && candidate.segmentUrl) {
     const parsed = new URL(candidate.segmentUrl);
@@ -460,11 +635,22 @@ function ivBytes(ivText, sequence) {
 }
 
 const keyCache = new Map();
+async function cacheLegacyAesKey(rawKey, cacheUrl) {
+  const bytes = rawKey instanceof ArrayBuffer ? new Uint8Array(rawKey) : rawKey;
+  if (bytes.byteLength !== 16) throw new Error(t("keyLengthInvalid", bytes.byteLength, `视频解密信息异常（${bytes.byteLength} 字节）。`));
+  const cryptoKey = await crypto.subtle.importKey("raw", bytes, { name: "AES-CBC" }, false, ["decrypt"]);
+  keyCache.set(cacheUrl, cryptoKey);
+  return cryptoKey;
+}
+
 async function decryptIfNeeded(segment, bytes) {
   if (!segment.key || segment.key.method === "NONE") return bytes;
   if (segment.key.method !== "AES-128") throw new Error(t("unsupportedEncryption", segment.key.method, `暂不支持这种视频加密方式：${segment.key.method}`));
   let cryptoKey = keyCache.get(segment.key.url);
   if (!cryptoKey) {
+    if (/^https:\/\/legacy\.local\/aes-key\//i.test(String(segment.key.url || ""))) {
+      throw new Error(t("legacyKeyMissing", null, "旧捕获的解密密钥尚未加载。请重新导入该目录，或打开任务后等待自动恢复密钥。"));
+    }
     cryptoKey = (async () => {
       const response = await fetchResponse(segment.key.url);
       const raw = await consumeResponse(response, "arrayBuffer");
@@ -505,13 +691,251 @@ function segmentFileName(segment) {
   return `${String(segment.sequence).padStart(8, "0")}.${ext === "m4s" ? "m4s" : "ts"}`;
 }
 
+function isValidSegmentSize(size) {
+  return Number(size || 0) >= MIN_SEGMENT_BYTES;
+}
+
+function skippableSequenceSet() {
+  return new Set((state?.skippableSequences || []).map(Number).filter((value) => Number.isFinite(value)));
+}
+
+function coveredSegmentCount() {
+  return Number(state?.done || 0) + skippableSequenceSet().size;
+}
+
+async function markSkippableSegment(sequence, verdict = {}) {
+  const set = skippableSequenceSet();
+  set.add(Number(sequence));
+  state.skippableSequences = [...set].sort((a, b) => a - b);
+  state.skippableCount = set.size;
+  state.segmentSkipVerdicts = { ...(state.segmentSkipVerdicts || {}), [sequence]: { status: "skippable", ...verdict, at: Date.now() } };
+  log(t("segmentMarkedSkippable", [sequence, Number(verdict.deltaSeconds || 0).toFixed(2), Number(verdict.expectedSeconds || 0).toFixed(2)], `分片 ${sequence} 可跳过：前后有效片时间轴已连贯（间隔约 ${Number(verdict.deltaSeconds || 0).toFixed(2)}s，播放列表约 ${Number(verdict.expectedSeconds || 0).toFixed(2)}s），不再重试下载。`));
+}
+
+function clearSkippableVerdicts(reason = "") {
+  if (!state) return false;
+  const had = skippableSequenceSet().size > 0 || Object.keys(state.segmentSkipVerdicts || {}).length > 0;
+  state.skippableSequences = [];
+  state.skippableCount = 0;
+  state.segmentSkipVerdicts = {};
+  if (had) log(t("skippableVerdictsCleared", reason || "resume", `已清除旧的可跳过结论（${reason || "resume"}），将按当前分片时间轴重新判断。`));
+  return had;
+}
+
+function timelineBreakSet() {
+  return new Set((state?.timelineBreaks || []).map(Number).filter((value) => Number.isFinite(value)));
+}
+
+function hasTimelineBreakAt(sequence) {
+  return timelineBreakSet().has(Number(sequence));
+}
+
+async function adjustTimelineShiftAndContinue(breakSequence, verdict = {}) {
+  if (!state) return;
+  const sequence = Number(breakSequence);
+  if (!Number.isFinite(sequence)) return;
+  if (hasTimelineBreakAt(sequence)) return;
+  const breaks = timelineBreakSet();
+  breaks.add(sequence);
+  state.timelineBreaks = [...breaks].sort((a, b) => a - b);
+  clearSkippableVerdicts("timeline-shift-adjust");
+  state.timelineShift = true;
+  state.timelineShiftAt = Date.now();
+  state.timelineShiftSequence = sequence;
+  state.stalled = false;
+  const message = t("timelineShiftAdjusted", [sequence, Number(verdict.deltaSeconds || 0).toFixed(2), verdict.reason || ""], `检测到分片 ${sequence} 接缝处时间轴变化（间隔约 ${Number(verdict.deltaSeconds || 0).toFixed(2)}s，${verdict.reason || ""}）。已在此处标记断点、清除旧可跳过结论，并继续下载。`);
+  state.message = message;
+  log(message);
+  await reclassifySkippableGaps();
+  await updateMissingTimeline();
+  await mirrorJob();
+}
+
+async function checkAdjacentTimeline(segment, decryptedBytes) {
+  if (!segment || !mediaPlaylist) return null;
+  const sequence = Number(segment.sequence);
+  const prev = playlistSegmentBySequence(sequence - 1);
+  const next = playlistSegmentBySequence(sequence + 1);
+  const headBytes = decryptedBytes
+    ? new Uint8Array(decryptedBytes.buffer, decryptedBytes.byteOffset, Math.min(decryptedBytes.byteLength, TS_TIMESTAMP_SAMPLE_BYTES))
+    : await readSegmentTimestampSample(sequence, "head");
+  const tailBytes = decryptedBytes && decryptedBytes.byteLength > TS_TIMESTAMP_SAMPLE_BYTES
+    ? decryptedBytes.subarray(Math.max(0, decryptedBytes.byteLength - TS_TIMESTAMP_SAMPLE_BYTES))
+    : (decryptedBytes || await readSegmentTimestampSample(sequence, "tail"));
+  const currentHead = headBytes ? WebKeeperMediaEngine.transportTimestamps(headBytes) : null;
+  const currentTail = tailBytes ? WebKeeperMediaEngine.transportTimestamps(tailBytes) : null;
+
+  if (prev && !hasTimelineBreakAt(sequence)
+    && Number(segment.discontinuity || 0) === Number(prev.discontinuity || 0)) {
+    const prevBytes = await readSegmentTimestampSample(sequence - 1, "tail");
+    if (prevBytes && currentHead?.ok) {
+      const prevTs = WebKeeperMediaEngine.transportTimestamps(prevBytes);
+      const verdict = WebKeeperMediaEngine.assessAdjacentSegmentContinuity({
+        previousLastPts: prevTs.lastPts,
+        nextFirstPts: currentHead.firstPts,
+        previousLastPcr: prevTs.lastPcr,
+        nextFirstPcr: currentHead.firstPcr,
+        previousDurationSeconds: Number(prev.duration || mediaPlaylist.targetDuration || 2),
+        playlistDiscontinuity: false
+      });
+      if (verdict.status === "shifted") {
+        await adjustTimelineShiftAndContinue(sequence, verdict);
+        return verdict;
+      }
+    }
+  }
+
+  if (next && !hasTimelineBreakAt(Number(next.sequence))
+    && Number(next.discontinuity || 0) === Number(segment.discontinuity || 0)) {
+    const nextBytes = await readSegmentTimestampSample(sequence + 1, "head");
+    if (nextBytes && currentTail?.ok) {
+      const nextTs = WebKeeperMediaEngine.transportTimestamps(nextBytes);
+      const verdict = WebKeeperMediaEngine.assessAdjacentSegmentContinuity({
+        previousLastPts: currentTail.lastPts,
+        nextFirstPts: nextTs.firstPts,
+        previousLastPcr: currentTail.lastPcr,
+        nextFirstPcr: nextTs.firstPcr,
+        previousDurationSeconds: Number(segment.duration || mediaPlaylist.targetDuration || 2),
+        playlistDiscontinuity: false
+      });
+      if (verdict.status === "shifted") {
+        await adjustTimelineShiftAndContinue(Number(next.sequence), verdict);
+        return verdict;
+      }
+    }
+  }
+  return null;
+}
+
+async function prepareTimelineAfterIdle({ reason = "resume" } = {}) {
+  if (!state) return;
+  const pausedAt = Number(state.pausedAt || 0);
+  const idleFrom = pausedAt || Number(state.updatedAt || 0);
+  const idleMs = idleFrom ? Date.now() - idleFrom : 0;
+  const longPause = idleMs >= LONG_PAUSE_MS;
+  clearSkippableVerdicts(longPause ? "long-pause" : reason);
+  state.pausedAt = 0;
+  state.timelineShift = false;
+  timelineShiftAlertShown = false;
+  if (longPause) {
+    state.message = t("timelineRecheckAfterPause", Math.round(idleMs / 60000), `已暂停约 ${Math.round(idleMs / 60000)} 分钟。继续下载前已清除旧的可跳过结论，并将检查新旧分片时间轴是否仍对齐；若对不上会自动标记断点并继续。`);
+    log(state.message);
+  }
+  if (mediaPlaylist) {
+    await reclassifySkippableGaps();
+    await updateMissingTimeline();
+  }
+}
+
+async function invalidateTinySegment(record, size = 0) {
+  if (!record) return;
+  try { await dbDelete("segments", record.id); } catch { /* already gone */ }
+  log(t("tinySegmentDiscarded", [record.sequence, size || record.size || 0], `分片 ${record.sequence} 只有 ${size || record.size || 0} 字节（小于 ${MIN_SEGMENT_BYTES}），已视为无效并等待重试。`));
+}
+
+async function readSegmentTimestampSample(sequence, side = "head") {
+  if (!segmentDirectory || sequence == null) return null;
+  if (skippableSequenceSet().has(Number(sequence))) return null;
+  const record = await dbGet("segments", `${state.id}:${sequence}`);
+  if (!record || !isValidSegmentSize(record.size)) return null;
+  try {
+    const file = await (await segmentDirectory.getFileHandle(record.fileName)).getFile();
+    if (!isValidSegmentSize(file.size)) return null;
+    if (side === "tail") {
+      const start = Math.max(0, file.size - TS_TIMESTAMP_SAMPLE_BYTES);
+      return new Uint8Array(await file.slice(start).arrayBuffer());
+    }
+    return new Uint8Array(await file.slice(0, Math.min(file.size, TS_TIMESTAMP_SAMPLE_BYTES)).arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+function playlistSegmentBySequence(sequence) {
+  return (mediaPlaylist?.segments || []).find((item) => Number(item.sequence) === Number(sequence)) || null;
+}
+
+async function classifySkippedSequence(segment) {
+  if (!segment || segment.gap) return { status: "unknown", reason: "NOT_A_SEGMENT" };
+  const sequence = Number(segment.sequence);
+  const cached = state?.segmentSkipVerdicts?.[sequence];
+  if (cached?.status === "skippable") return cached;
+  const previous = playlistSegmentBySequence(sequence - 1);
+  const next = playlistSegmentBySequence(sequence + 1);
+  if (!previous || !next) return { status: "unknown", reason: "EDGE_SEGMENT" };
+  if (Number(next.discontinuity || 0) !== Number(previous.discontinuity || 0)
+    || Number(segment.discontinuity || 0) !== Number(previous.discontinuity || 0)
+    || hasTimelineBreakAt(sequence)
+    || hasTimelineBreakAt(sequence + 1)) {
+    return { status: "unknown", reason: "DISCONTINUITY" };
+  }
+  const prevBytes = await readSegmentTimestampSample(sequence - 1, "tail");
+  const nextBytes = await readSegmentTimestampSample(sequence + 1, "head");
+  if (!prevBytes || !nextBytes) return { status: "unknown", reason: "NEIGHBOR_MISSING" };
+  const prevTs = WebKeeperMediaEngine.transportTimestamps(prevBytes);
+  const nextTs = WebKeeperMediaEngine.transportTimestamps(nextBytes);
+  if (!prevTs.ok || !nextTs.ok) return { status: "unknown", reason: "NO_TIMESTAMPS" };
+  return WebKeeperMediaEngine.assessSkippedSegmentContinuity({
+    previousLastPts: prevTs.lastPts,
+    nextFirstPts: nextTs.firstPts,
+    previousLastPcr: prevTs.lastPcr,
+    nextFirstPcr: nextTs.firstPcr,
+    expectedDurationSeconds: Number(segment.duration || mediaPlaylist?.targetDuration || 2)
+  });
+}
+
+async function maybeMarkSkippable(segment, { tinySize = null } = {}) {
+  const verdict = await classifySkippedSequence(segment);
+  state.segmentSkipVerdicts = { ...(state.segmentSkipVerdicts || {}), [segment.sequence]: { ...verdict, tinySize, at: Date.now() } };
+  if (verdict.status === "skippable") {
+    await markSkippableSegment(segment.sequence, verdict);
+    return verdict;
+  }
+  if (tinySize != null) {
+    log(t("tinySegmentNeedsRetry", [segment.sequence, tinySize, verdict.reason || ""], `分片 ${segment.sequence} 只有 ${tinySize} 字节，且前后片时间轴不连贯（${verdict.reason || "unknown"}），需要重试下载。`));
+  }
+  return verdict;
+}
+
+async function reclassifySkippableGaps() {
+  if (!mediaPlaylist || !state || skippableClassifyRunning) return;
+  skippableClassifyRunning = true;
+  try {
+    const records = (await listSegmentRecords(state.id)).filter((item) => item.kind !== "dash" && isValidSegmentSize(item.size));
+    const saved = new Set(records.map((item) => Number(item.sequence)));
+    const skippable = skippableSequenceSet();
+    let changed = false;
+    for (const segment of mediaPlaylist.segments) {
+      if (segment.gap || saved.has(Number(segment.sequence)) || skippable.has(Number(segment.sequence))) continue;
+      if (!saved.has(Number(segment.sequence) - 1) || !saved.has(Number(segment.sequence) + 1)) continue;
+      const verdict = await classifySkippedSequence(segment);
+      if (verdict.status === "skippable") {
+        await markSkippableSegment(segment.sequence, verdict);
+        skippable.add(Number(segment.sequence));
+        changed = true;
+      } else {
+        state.segmentSkipVerdicts = { ...(state.segmentSkipVerdicts || {}), [segment.sequence]: { ...verdict, at: Date.now() } };
+      }
+    }
+    if (changed) await updateMissingTimeline();
+  } finally {
+    skippableClassifyRunning = false;
+  }
+}
+
 async function savedSegment(sequence) {
+  if (skippableSequenceSet().has(Number(sequence))) return { skipped: true, sequence: Number(sequence) };
   const record = await dbGet("segments", `${state.id}:${sequence}`);
   if (!record || !segmentDirectory) return null;
   try {
     const handle = await segmentDirectory.getFileHandle(record.fileName);
     const file = await handle.getFile();
-    return file.size > 0 ? { ...record, size: file.size } : null;
+    if (isValidSegmentSize(file.size)) return { ...record, size: file.size };
+    const meta = playlistSegmentBySequence(sequence) || { sequence, duration: mediaPlaylist?.targetDuration || 2 };
+    const verdict = await maybeMarkSkippable(meta, { tinySize: file.size });
+    await invalidateTinySegment(record, file.size);
+    if (verdict.status === "skippable") return { skipped: true, sequence: Number(sequence) };
+    return null;
   } catch {
     return null;
   }
@@ -624,12 +1048,22 @@ async function saveSegment(segment, observedHeaders = {}, options = {}) {
   const encrypted = await fetchMediaBytes(segment.url, { byteRange: segment.byteRange, headers: observedHeaders, ...options });
   if (encrypted.byteLength < 16) throw new Error(t("downloadedItemInvalid", segment.sequence, `下载到的第 ${segment.sequence} 项内容异常。`));
   const decrypted = await decryptIfNeeded(segment, encrypted);
+  if (!isValidSegmentSize(decrypted.byteLength)) {
+    const verdict = await maybeMarkSkippable(segment, { tinySize: decrypted.byteLength });
+    await updateMissingTimeline();
+    await mirrorJob();
+    if (verdict.status === "skippable") return { skipped: true, sequence: segment.sequence, verdict };
+    throw new Error(t("downloadedItemTooSmall", [segment.sequence, decrypted.byteLength], `下载到的第 ${segment.sequence} 项只有 ${decrypted.byteLength} 字节，小于有效分片下限 ${MIN_SEGMENT_BYTES}，已忽略。`));
+  }
   const fileName = segmentFileName(segment);
   await writeFile(segmentDirectory, fileName, decrypted);
   const record = { id: `${state.id}:${segment.sequence}`, jobId: state.id, sequence: segment.sequence, fileName, size: decrypted.byteLength, url: segment.url, savedAt: Date.now() };
   await dbPut("segments", record);
   state.done = Number(state.done || 0) + 1;
   state.bytes = Number(state.bytes || 0) + decrypted.byteLength;
+  const decryptedView = decrypted instanceof Uint8Array ? decrypted : new Uint8Array(decrypted);
+  await checkAdjacentTimeline(segment, decryptedView);
+  await reclassifySkippableGaps();
   await updateMissingTimeline();
   await mirrorJob();
   return record;
@@ -675,19 +1109,33 @@ async function reconcileSaved() {
       if (!directory) continue;
       const handle = await directory.getFileHandle(record.fileName);
       const file = await handle.getFile();
-      if (file.size > 0) { count += 1; bytes += file.size; }
+      if (record.kind === "dash" || record.kind === "hls-cmaf") {
+        if (file.size > 0) { count += 1; bytes += file.size; }
+      } else if (isValidSegmentSize(file.size)) {
+        count += 1;
+        bytes += file.size;
+        if (Number(record.size || 0) !== file.size) await dbPut("segments", { ...record, size: file.size });
+      } else {
+        const meta = playlistSegmentBySequence(record.sequence) || { sequence: record.sequence, duration: mediaPlaylist?.targetDuration || 2 };
+        await maybeMarkSkippable(meta, { tinySize: file.size });
+        await invalidateTinySegment(record, file.size);
+      }
     } catch { /* ledger entry without file */ }
   }
   state.done = count;
   state.bytes = bytes;
+  await reclassifySkippableGaps();
   await updateMissingTimeline();
   await mirrorJob();
 }
 
 async function updateMissingTimeline() {
   if (!mediaPlaylist) return [];
-  const records = (await listSegmentRecords(state.id)).filter((item) => item.kind !== "dash");
-  state.missingRanges = WebKeeperMediaEngine.missingTimeline(mediaPlaylist.segments, new Set(records.map((item) => item.sequence)));
+  const records = (await listSegmentRecords(state.id)).filter((item) => item.kind !== "dash" && isValidSegmentSize(item.size));
+  const saved = new Set(records.map((item) => item.sequence));
+  const skippable = skippableSequenceSet();
+  state.skippableCount = skippable.size;
+  state.missingRanges = WebKeeperMediaEngine.missingTimeline(mediaPlaylist.segments, saved, skippable);
   state.missing = state.missingRanges.reduce((sum, range) => sum + range.count, 0);
   return state.missingRanges;
 }
@@ -899,9 +1347,11 @@ async function runHlsDirect() {
   state.progressUnit = "items";
   await ensureDirectories();
   await reconcileSaved();
+  await prepareTimelineAfterIdle({ reason: "direct-start" });
   state.status = "downloading";
   state.message = t("directDownloadWorking", null, "正在获取视频内容并保存未完成的部分。可以把此页面留在后台，但请不要关闭浏览器。");
   await mirrorJob();
+  startProgressWatchdog();
   try {
     const knownSegments = new Map();
     let stalledRounds = 0;
@@ -939,8 +1389,14 @@ async function runHlsDirect() {
       if (stalledRounds >= 5) {
         state.status = "waiting";
         state.errorCode = "PLAYLIST_STALLED";
+        state.stalled = true;
         state.message = t("directStalled", null, "直接下载暂时没有新内容。你可以稍后继续，或确认改用网页辅助。");
         await mirrorJob();
+        if (!stallAlertShown) {
+          stallAlertShown = true;
+          alert(t("stallDirectAlert", Math.round(STALL_WARN_MS / 1000), `进度已约 ${Math.round(STALL_WARN_MS / 1000)} 秒没有增加。可稍后继续，或改用网页辅助。`));
+        }
+        stopProgressWatchdog();
         return;
       }
       state.message = t("liveWaiting", null, "正在等待网站发布后续内容，已经保存的部分不会丢失。");
@@ -948,7 +1404,16 @@ async function runHlsDirect() {
       await waitFor(Math.max(1500, Math.min(8000, Number(playlist.targetDuration || 4) * 750)));
     }
     if (paused) return;
+    await reclassifySkippableGaps();
+    await updateMissingTimeline();
+    if (Number(state.missing || 0) > 0 && coveredSegmentCount() < Number(state.total || 0)) {
+      state.status = "waiting";
+      state.message = t("remainingCount", state.missing, `仍有 ${state.missing} 项待补。`);
+      await mirrorJob();
+      return;
+    }
     state.errorCode = "";
+    state.stalled = false;
     state.message = t("allContentSaved", null, "视频内容已全部保存，正在生成可播放文件。");
     await mirrorJob();
     if (autoFinalize) await mergeOutput(false);
@@ -964,6 +1429,8 @@ async function runHlsDirect() {
     state.message = t("recoverableDownloadError", error.message, `${error.message} 已保存的内容不会删除，可以回到网页刷新后继续。`);
     log(`失败：${error.message}`);
     await mirrorJob();
+  } finally {
+    if (!["downloading", "capturing", "waiting"].includes(state?.status) || paused) stopProgressWatchdog();
   }
 }
 
@@ -1173,10 +1640,12 @@ async function runDashDirect() {
   state.status = "downloading";
   state.message = t("dashWorking", null, "正在下载视频与音频轨道，已完成的部分可以断点继续。");
   await mirrorJob();
+  startProgressWatchdog();
   try {
     const text = await fetchText(manifestUrl);
     const manifest = WebKeeperMediaEngine.parseDashManifest(text, manifestUrl);
     if (manifest.drm) throw new Error(t("drmUnsupported", null, "这个视频受 DRM 保护，Web Keeper 不会尝试绕过网站的访问控制。"));
+    adoptDashSubtitles(manifest);
     const tracks = WebKeeperMediaEngine.selectDashTracks(manifest, targetHeight(candidate.resolution));
     if (!tracks.length || tracks.some((track) => !track.segments.length)) throw new Error(t("dashNoTracks", null, "没有找到可直接保存的 DASH 音视频轨道。"));
     state.resolution = tracks.find((track) => track.contentType === "video")?.height ? `${tracks.find((track) => track.contentType === "video").height}p` : state.resolution;
@@ -1206,6 +1675,8 @@ async function runDashDirect() {
     state.message = t("recoverableDownloadError", error.message, `${error.message} 已保存的内容不会删除，可以回到网页刷新后继续。`);
     log(`DASH: ${error.message}`);
     await mirrorJob();
+  } finally {
+    if (!["downloading", "capturing", "waiting"].includes(state?.status) || paused) stopProgressWatchdog();
   }
 }
 
@@ -1313,6 +1784,28 @@ async function locateCaptureSegment(event) {
   return segmentIndex.find(event.url);
 }
 
+function scheduleCaptureRetry(event) {
+  const attempts = Number(captureRetryCounts.get(event.url) || 0) + 1;
+  if (attempts > MAX_CAPTURE_RETRIES) return false;
+  captureRetryCounts.set(event.url, attempts);
+  if (captureRetryCounts.size > 500) captureRetryCounts.delete(captureRetryCounts.keys().next().value);
+  return deferCaptureSegment(event);
+}
+
+async function reportCaptureItemError(event, error) {
+  // Pausing aborts the request in flight; that is the user's own action, not a failure.
+  if (paused) {
+    deferCaptureSegment(event);
+    return;
+  }
+  state.failed = Number(state.failed || 0) + 1;
+  state.message = scheduleCaptureRetry(event)
+    ? t("assistedItemFailed", error.message, `有一部分暂时未能保存：${error.message}。稍后会自动重试。`)
+    : t("assistedItemGaveUp", error.message, `有一部分多次未能保存：${error.message}。可以用智能补全，或回到网页重新播放这一段。`);
+  log(state.message);
+  await mirrorJob();
+}
+
 function deferCaptureSegment(event) {
   if (pendingCaptureSegments.some((item) => item.url === event.url)) return false;
   pendingCaptureSegments = [...pendingCaptureSegments, event].slice(-300);
@@ -1352,11 +1845,23 @@ function updateDashCaptureTotals() {
   state.selectedTracks = tracks.map((track) => ({ id: track.id, contentType: track.contentType, codecs: track.codecs, bandwidth: track.bandwidth, segmentCount: track.segments.length }));
 }
 
+function adoptDashSubtitles(manifest) {
+  const usable = (manifest.subtitles || []).filter((item) => item.url && !item.segmented);
+  const segmented = (manifest.subtitles || []).filter((item) => item.segmented).length;
+  if (segmented) log(`清单里有 ${segmented} 条分片式字幕轨，当前版本无法生成可用字幕文件，已跳过`);
+  if (!usable.length) return;
+  const before = (candidate.subtitles || []).length;
+  candidate.subtitles = Array.from(new Set([...(candidate.subtitles || []), ...usable.map((item) => item.url)]));
+  if (candidate.subtitles.length > before) log(`从清单中发现 ${candidate.subtitles.length - before} 条字幕`);
+  state.candidate = { ...candidate };
+}
+
 async function loadDashCaptureManifest() {
   const manifestUrl = captureManifestUrl();
   if (!manifestUrl) throw new Error(t("dashManifestMissing", null, "尚未找到完整的 DASH 视频信息，请回到网页播放几秒后重试。"));
   const manifest = WebKeeperMediaEngine.parseDashManifest(await fetchText(manifestUrl), manifestUrl);
   if (manifest.drm) throw new Error(t("drmUnsupported", null, "这个视频受 DRM 保护，Web Keeper 不会尝试绕过网站的访问控制。"));
+  adoptDashSubtitles(manifest);
   const tracks = WebKeeperMediaEngine.mergeDashCaptureTracks(dashCapture?.index.tracks || [], manifest.tracks);
   const index = WebKeeperMediaEngine.dashCaptureIndex({ tracks });
   if (!index.tracks.length) throw new Error(t("dashNoTracks", null, "没有找到可直接保存的 DASH 音视频轨道。"));
@@ -1447,6 +1952,7 @@ async function captureObservedDashSegment(event) {
     }
     log(`播放器已请求 ${track.contentType} 第 ${located.index + 1} 项，开始保存`);
     await saveDashSegment(directory, track, track.segments[located.index], located.index, options);
+    captureRetryCounts.delete(event.url);
     const isLive = dashCapture.manifest.type === "dynamic";
     state.status = "capturing";
     state.message = isLive
@@ -1457,10 +1963,7 @@ async function captureObservedDashSegment(event) {
     await replayPendingCaptureSegments();
     if (!isLive && state.total && state.done >= state.total && autoFinalize) await finalizeDashCapture();
   } catch (error) {
-    state.failed = Number(state.failed || 0) + 1;
-    state.message = t("assistedItemFailed", error.message, `有一部分暂时未能保存：${error.message}。再次播放到这里时会重试。`);
-    log(state.message);
-    await mirrorJob();
+    await reportCaptureItemError(event, error);
   }
 }
 
@@ -1506,14 +2009,17 @@ async function runDashCapture() {
   state.progressUnit = "items";
   await ensureDirectories();
   await ensurePageCaptureHook(candidate.tabId, { announce: true });
+  await prepareTimelineAfterIdle({ reason: "dash-capture-start" });
   state.status = "waiting";
   state.message = t("assistedPreparing", null, "正在准备网页辅助保存。");
   await mirrorJob();
+  startProgressWatchdog();
   const queued = await queuedCaptureEvents();
   try {
     await loadDashCaptureManifest();
     await reconcileDashSaved(dashCapture.directory, dashSelectedTracks());
     await updateDashMissingTimeline();
+    await restoreCaptureAcceleration();
     state.status = "capturing";
     state.message = t("assistedWorking", null, "正在跟随网页播放保存内容，不会提前请求后续部分。");
   } catch (error) {
@@ -1522,7 +2028,10 @@ async function runDashCapture() {
     log(`等待 DASH 清单：${error.message}`);
   }
   await mirrorJob();
-  if (state.status === "capturing") await replayQueuedCaptureEvents(queued);
+  if (state.status === "capturing") {
+    await replayQueuedCaptureEvents(queued);
+    await replayPendingCaptureSegments();
+  }
 }
 
 async function adoptQueuedManifests() {
@@ -1542,16 +2051,22 @@ async function runCapture() {
   await ensureDirectories();
   await ensurePageCaptureHook(candidate.tabId, { announce: true });
   await reconcileSaved();
+  await prepareTimelineAfterIdle({ reason: "capture-start" });
   capturePlaylistLocked = Number(state.done || 0) > 0;
   qualitySwitchReportedAt = 0;
   state.status = "waiting";
   state.message = t("assistedPreparing", null, "正在准备网页辅助保存。");
   await mirrorJob();
+  startProgressWatchdog();
   const queued = await queuedCaptureEvents();
   const queuedPlaylists = queued.filter((event) => event.kind === "playlist").map((event) => event.url);
   candidate.playlistUrls = Array.from(new Set([...(candidate.playlistUrls || []), ...queuedPlaylists]));
   await refreshCapturePlaylist();
-  if (state.status === "capturing") await replayQueuedCaptureEvents(queued);
+  await restoreCaptureAcceleration();
+  if (state.status === "capturing") {
+    await replayQueuedCaptureEvents(queued);
+    await replayPendingCaptureSegments();
+  }
 }
 
 async function queuedCaptureEvents() {
@@ -1574,7 +2089,11 @@ async function replayQueuedCaptureEvents(events = []) {
 function matchesCandidate(event) {
   if (!state || !event || !candidate) return false;
   if (event.candidateId && candidate.id && event.candidateId === candidate.id) return true;
-  return Number(event.tabId) === Number(candidate.tabId) && event.product === candidate.product && (candidate.resolution === "auto" || event.resolution === candidate.resolution || event.resolution === "auto");
+  // The candidate id carries the tab id, so an unfinished task must also match the same
+  // work reopened in a new tab. The page URL keeps sites apart whose paths share a product.
+  if (event.product !== candidate.product) return false;
+  if (event.pageUrl && candidate.pageUrl && event.pageUrl !== candidate.pageUrl) return false;
+  return candidate.resolution === "auto" || event.resolution === candidate.resolution || event.resolution === "auto";
 }
 
 async function captureObservedSegment(event) {
@@ -1611,6 +2130,7 @@ async function captureObservedSegment(event) {
     if (existing) return;
     log(`播放器已请求分片 ${sequence}，开始保存`);
     await saveSegment({ ...meta, url: event.url }, event.headers || {}, { pageTabId: event.tabId ?? candidate.tabId, cacheMode: "force-cache", preferPageBuffer: true });
+    captureRetryCounts.delete(event.url);
     capturePlaylistLocked = true;
     state.status = "capturing";
     state.message = state.isLive
@@ -1618,18 +2138,20 @@ async function captureObservedSegment(event) {
       : t("assistedSaving", null, "正在跟随网页播放保存；已经完成的内容会保留，可随时暂停。");
     await mirrorJob();
     await replayPendingCaptureSegments();
-    if (!state.isLive && state.total && state.done >= state.total && autoFinalize) await mergeOutput(false);
+    if (!state.isLive && state.total && coveredSegmentCount() >= state.total && autoFinalize) await mergeOutput(false);
   } catch (error) {
-    state.failed = Number(state.failed || 0) + 1;
-    state.message = t("assistedItemFailed", error.message, `有一部分暂时未能保存：${error.message}。再次播放到这里时会重试。`);
-    log(state.message);
-    await mirrorJob();
+    await reportCaptureItemError(event, error);
   }
 }
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type !== "media-observed" || !matchesCandidate(message.event)) return;
   const event = message.event;
+  if (Number(event.tabId) >= 0 && Number(event.tabId) !== Number(candidate.tabId)) {
+    candidate.tabId = Number(event.tabId);
+    log("这个视频正在新的标签页播放，已跟随过去继续保存");
+    void ensurePageCaptureHook(candidate.tabId, { announce: true });
+  }
   candidate.headers = { ...(candidate.headers || {}), ...(event.headers || {}) };
   if (event.kind === "playlist" && !pinnedPlaylistUrl) candidate.playlistUrl = event.url;
   if (event.kind === "manifest") candidate.manifestUrl = event.url;
@@ -1687,18 +2209,28 @@ async function createMp4FromTransportStream(expected, bySequence, outputName, du
 async function mergeOutput(allowPartial = true) {
   await ensureDirectories();
   if (!mediaPlaylist) await loadMediaPlaylist();
-  const records = await listSegmentRecords(state.id);
+  await reclassifySkippableGaps();
+  const records = (await listSegmentRecords(state.id)).filter((item) => item.kind !== "dash" && isValidSegmentSize(item.size));
   const bySequence = new Map(records.map((item) => [item.sequence, item]));
+  const skippable = skippableSequenceSet();
   const playlistExpected = mediaPlaylist.segments.filter((item) => !item.gap).map((item) => item.sequence);
   const expected = state.wasLive
     ? Array.from(new Set([...records.map((item) => item.sequence), ...playlistExpected])).sort((a, b) => a - b)
     : playlistExpected;
-  const missing = expected.filter((sequence) => !bySequence.has(sequence));
+  const missing = expected.filter((sequence) => !bySequence.has(sequence) && !skippable.has(Number(sequence)));
   if (missing.length && !allowPartial) throw new Error(t("remainingCount", missing.length, `仍有 ${missing.length} 项待补。`));
   if (missing.length && !confirm(t("createPartialConfirm", missing.length, `仍有 ${missing.length} 项待补。要先按现有内容生成一个不完整视频吗？`))) return;
   paused = false;
   state.status = "merging";
-  state.message = missing.length ? t("creatingPartial", missing.length, `正在按现有内容生成视频，将跳过 ${missing.length} 处缺口。`) : t("creatingPlayableVideo", null, "正在生成可播放视频。");
+  const skipNote = skippable.size ? t("creatingWithSkippable", skippable.size, `将跳过 ${skippable.size} 个已确认空壳分片。`) : "";
+  const breakNote = timelineBreakSet().size
+    ? t("creatingWithTimelineBreaks", timelineBreakSet().size, `接缝处有 ${timelineBreakSet().size} 处已标记的时间轴断点，封装时会尽量重排时间戳以继续生成。`)
+    : "";
+  state.message = missing.length
+    ? t("creatingPartial", missing.length, `正在按现有内容生成视频，将跳过 ${missing.length} 处缺口。`) + (skipNote ? ` ${skipNote}` : "") + (breakNote ? ` ${breakNote}` : "")
+    : (skippable.size || breakNote
+      ? `${skippable.size ? t("creatingPlayableVideoSkippable", skippable.size, `正在生成可播放视频；已确认可跳过 ${skippable.size} 个空壳分片。`) : t("creatingPlayableVideo", null, "正在生成可播放视频。")}${breakNote ? ` ${breakNote}` : ""}`
+      : t("creatingPlayableVideo", null, "正在生成可播放视频。"));
   await mirrorJob();
   try {
     const firstRecord = expected.map((sequence) => bySequence.get(sequence)).find(Boolean);
@@ -1747,8 +2279,15 @@ async function mergeOutput(allowPartial = true) {
     state.status = "complete";
     state.validationVersion = 1;
     state.missing = missing.length;
+    state.skippableCount = skippable.size;
     if (state.mode === "browser-assisted") await stopPageCaptureHook(candidate.tabId);
-    state.message = missing.length ? t("outputPartial", [outputName, missing.length], `已生成 ${outputName}，但仍有 ${missing.length} 处缺口。`) : t("outputComplete", outputName, `已生成 ${outputName}。确认播放正常后，可以清理临时下载文件。`);
+    if (missing.length) {
+      state.message = t("outputPartial", [outputName, missing.length], `已生成 ${outputName}，但仍有 ${missing.length} 处缺口。`);
+    } else if (skippable.size) {
+      state.message = t("outputCompleteSkippable", [outputName, skippable.size], `已生成 ${outputName}。其中 ${skippable.size} 个空壳分片因前后时间轴连贯已跳过，无需重试。`);
+    } else {
+      state.message = t("outputComplete", outputName, `已生成 ${outputName}。确认播放正常后，可以清理临时下载文件。`);
+    }
     log(state.message);
     await mirrorJob();
     if (!missing.length && cleanupAfterMerge) {
@@ -1827,10 +2366,15 @@ async function resumeTask() {
 async function pauseTask() {
   paused = true;
   smartFillRunning = false;
+  smartFillActiveRange = null;
+  stopSeekBoost();
+  stopProgressWatchdog();
   for (const controller of activeControllers) controller.abort();
   activeControllers.clear();
   activeController = null;
   state.status = "paused";
+  state.pausedAt = Date.now();
+  state.stalled = false;
   state.message = t("taskPausedMessage", null, "下载已暂停，已经保存的内容不会删除。");
   await mirrorJob();
 }
@@ -1847,32 +2391,209 @@ async function switchToAssisted() {
 }
 
 async function seekVideoAndInspect(tabId, targetTime) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    args: [targetTime],
-    func: async (time) => {
-      const videos = [...document.querySelectorAll("video")].filter((video) => video.duration || video.readyState || video.clientWidth || video.clientHeight);
-      const video = videos.sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
-      if (!video) return { ok: false, reason: "NO_VIDEO" };
-      const duration = Number.isFinite(video.duration) ? video.duration : 0;
-      const target = duration ? Math.min(Math.max(0, time), Math.max(0, duration - 0.25)) : Math.max(0, time);
-      video.currentTime = target;
-      try { await video.play(); } catch { /* page may require a manual play gesture */ }
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 2200);
-        const done = () => { clearTimeout(timer); resolve(); };
-        video.addEventListener("loadeddata", done, { once: true });
-        video.addEventListener("canplay", done, { once: true });
-        video.addEventListener("seeked", done, { once: true });
-      });
-      let bufferedEnd = 0;
-      for (let index = 0; index < video.buffered.length; index += 1) {
-        if (video.buffered.start(index) <= video.currentTime + 0.5) bufferedEnd = Math.max(bufferedEnd, video.buffered.end(index));
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [targetTime],
+      func: async (time) => {
+        const videos = [...document.querySelectorAll("video")].filter((video) => video.duration || video.readyState || video.clientWidth || video.clientHeight);
+        const video = videos.sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+        if (!video) return { ok: false, reason: "NO_VIDEO" };
+        const duration = Number.isFinite(video.duration) ? video.duration : 0;
+        const target = duration ? Math.min(Math.max(0, time), Math.max(0, duration - 0.25)) : Math.max(0, time);
+        video.currentTime = target;
+        try { await video.play(); } catch { /* page may require a manual play gesture */ }
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 2200);
+          const done = () => { clearTimeout(timer); resolve(); };
+          video.addEventListener("loadeddata", done, { once: true });
+          video.addEventListener("canplay", done, { once: true });
+          video.addEventListener("seeked", done, { once: true });
+        });
+        let bufferedEnd = 0;
+        for (let index = 0; index < video.buffered.length; index += 1) {
+          if (video.buffered.start(index) <= video.currentTime + 0.5) bufferedEnd = Math.max(bufferedEnd, video.buffered.end(index));
+        }
+        return { ok: true, readyState: video.readyState, currentTime: video.currentTime, bufferedEnd, paused: video.paused, duration };
       }
-      return { ok: true, readyState: video.readyState, currentTime: video.currentTime, bufferedEnd, paused: video.paused, duration };
+    });
+    return (results || []).map((item) => item?.result).find((item) => item?.ok) || (results || []).map((item) => item?.result).find(Boolean) || { ok: false, reason: "NO_RESULT" };
+  } catch {
+    return { ok: false, reason: "NO_RESULT" };
+  }
+}
+
+function stopSeekBoost() {
+  if (seekBoostTimer) {
+    clearInterval(seekBoostTimer);
+    seekBoostTimer = null;
+  }
+}
+
+async function stepSeekForward(stepSeconds = SEEK_BOOST_STEP_SECONDS) {
+  const tabId = Number(candidate?.tabId);
+  if (!(tabId >= 0) || paused) return null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [Number(stepSeconds) || 10],
+      func: (step) => {
+        const videos = [...document.querySelectorAll("video")].filter((item) => item.duration || item.readyState || item.clientWidth);
+        const video = videos.sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+        if (!video) return { ok: false, reason: "NO_VIDEO" };
+        const duration = Number.isFinite(video.duration) ? video.duration : 0;
+        const next = duration ? Math.min(video.currentTime + step, Math.max(0, duration - 0.25)) : video.currentTime + step;
+        video.muted = true;
+        video.currentTime = next;
+        try { void video.play(); } catch { /* gesture may be required */ }
+        // Also dispatch ArrowRight for players that only listen to keyboard seeking.
+        try {
+          video.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39, bubbles: true }));
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39, bubbles: true }));
+        } catch { /* some pages block synthetic keys */ }
+        return { ok: true, currentTime: video.currentTime, duration, ended: Boolean(duration && next >= duration - 0.3) };
+      }
+    });
+    return (results || []).map((item) => item?.result).find((item) => item?.ok) || (results || []).map((item) => item?.result).find(Boolean) || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedSeekBoostSettings() {
+  const intervalSec = Math.min(30, Math.max(0.25, Number(state?.captureSeekIntervalSec ?? SEEK_BOOST_INTERVAL_MS / 1000) || 1));
+  const stepSeconds = Math.min(120, Math.max(1, Math.round(Number(state?.captureSeekStepSeconds ?? SEEK_BOOST_STEP_SECONDS) || 10)));
+  if (state) {
+    state.captureSeekIntervalSec = intervalSec;
+    state.captureSeekStepSeconds = stepSeconds;
+  }
+  return { intervalSec, stepSeconds, intervalMs: Math.round(intervalSec * 1000) };
+}
+
+function startSeekBoost(overrides = {}) {
+  const settings = normalizedSeekBoostSettings();
+  const stepSeconds = Number(overrides.stepSeconds) || settings.stepSeconds;
+  const intervalMs = Number(overrides.intervalMs) || settings.intervalMs;
+  stopSeekBoost();
+  state.captureSpeedMode = "seek";
+  seekBoostTimer = setInterval(() => {
+    if (paused || !state || !["capturing", "waiting"].includes(state.status)) return;
+    void stepSeekForward(stepSeconds).then((result) => {
+      if (result?.ended) {
+        stopSeekBoost();
+        state.message = t("captureSeekBoostEnded", null, "已快进到接近结尾；若仍有缺口，可用智能补全。");
+        void mirrorJob();
+      }
+    });
+  }, Math.max(250, intervalMs));
+}
+
+async function applySeekBoostSettingsFromInputs({ restart = true } = {}) {
+  if (!state) return;
+  state.captureSeekIntervalSec = Number($("seekBoostInterval").value);
+  state.captureSeekStepSeconds = Number($("seekBoostStep").value);
+  const settings = normalizedSeekBoostSettings();
+  $("seekBoostInterval").value = String(settings.intervalSec);
+  $("seekBoostStep").value = String(settings.stepSeconds);
+  if (restart && state.captureSpeedMode === "seek" && !paused && ["capturing", "waiting"].includes(state.status)) {
+    await applyCaptureSpeed(1);
+    startSeekBoost(settings);
+    state.message = t("captureSeekBoostApplied", [settings.intervalSec, settings.stepSeconds], `已改为每 ${settings.intervalSec} 秒快进约 ${settings.stepSeconds} 秒（类似连续按右方向键），不依赖播放器倍速。`);
+    log(state.message);
+  }
+  await mirrorJob();
+}
+
+async function restoreCaptureAcceleration() {
+  if (state?.captureSpeedMode === "seek" || String(state?.captureSpeed) === "seek10") {
+    await applyCaptureSpeed(1);
+    startSeekBoost();
+    return { mode: "seek" };
+  }
+  const wanted = Number(state?.captureSpeed || 1);
+  if (wanted > 1) {
+    const applied = await applyCaptureSpeed(wanted);
+    if (!applied?.ok || Math.abs(Number(applied.rate) - wanted) > 0.05) {
+      startSeekBoost();
+      return { mode: "seek", fallback: true, applied };
     }
-  });
-  return results?.[0]?.result || { ok: false, reason: "NO_RESULT" };
+    state.captureSpeedMode = "rate";
+    return { mode: "rate", applied };
+  }
+  stopSeekBoost();
+  state.captureSpeedMode = "rate";
+  await applyCaptureSpeed(1);
+  return { mode: "rate" };
+}
+
+async function applyCaptureSpeed(rate = Number(state?.captureSpeed || 1)) {
+  const tabId = Number(candidate?.tabId);
+  if (!(tabId >= 0)) return null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [Number(rate) || 1],
+      func: (wanted) => {
+        const videos = [...document.querySelectorAll("video")].filter((item) => item.duration || item.readyState || item.clientWidth);
+        const video = videos.sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+        if (!video) return null;
+        try {
+          if (wanted > 1) video.muted = true;
+          video.playbackRate = wanted;
+          void video.play().catch(() => {});
+        } catch (error) {
+          return { ok: false, reason: String(error?.message || error) };
+        }
+        return { ok: true, rate: video.playbackRate };
+      }
+    });
+    return (results || []).map((item) => item?.result).find(Boolean) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function changeCaptureSpeed(rate) {
+  const raw = String(rate || "1");
+  if (raw === "seek10") {
+    stopSeekBoost();
+    const settings = normalizedSeekBoostSettings();
+    state.captureSpeed = settings.stepSeconds;
+    state.captureSpeedMode = "seek";
+    await applyCaptureSpeed(1);
+    startSeekBoost(settings);
+    state.message = t("captureSeekBoostApplied", [settings.intervalSec, settings.stepSeconds], `已改为每 ${settings.intervalSec} 秒快进约 ${settings.stepSeconds} 秒（类似连续按右方向键），不依赖播放器倍速。`);
+    log(state.message);
+    await mirrorJob();
+    render();
+    return;
+  }
+  const wanted = Number(raw) || 1;
+  stopSeekBoost();
+  state.captureSpeed = wanted;
+  state.captureSpeedMode = "rate";
+  if (wanted <= 1) {
+    await applyCaptureSpeed(1);
+    state.message = t("captureSpeedNormal", null, "正常速度");
+    log(state.message);
+    await mirrorJob();
+    render();
+    return;
+  }
+  const applied = await applyCaptureSpeed(wanted);
+  const settings = normalizedSeekBoostSettings();
+  if (!applied) {
+    startSeekBoost(settings);
+    state.message = t("captureSpeedFallbackSeek", [settings.intervalSec, settings.stepSeconds], `找不到可倍速的播放器，已改为自动快进（每 ${settings.intervalSec} 秒约 +${settings.stepSeconds}s）。`);
+  } else if (!applied.ok || Math.abs(Number(applied.rate) - wanted) > 0.05) {
+    startSeekBoost(settings);
+    state.message = t("captureSpeedFallbackSeekLimited", [wanted, applied.rate || 1, settings.intervalSec, settings.stepSeconds], `网站不支持 ${wanted}x（当前约 ${applied.rate || 1}x），已改为自动快进（每 ${settings.intervalSec} 秒约 +${settings.stepSeconds}s）。`);
+  } else {
+    state.message = t("captureSpeedApplied", wanted, `已按 ${wanted}x 静音播放来加快保存；速度过高时播放器可能来不及请求，出现缺口可用智能补全。`);
+  }
+  log(state.message);
+  await mirrorJob();
+  render();
 }
 
 async function smartFillMissing() {
@@ -1880,45 +2601,110 @@ async function smartFillMissing() {
   if (!confirm(t("smartFillConfirm", null, "开始智能补全？Web Keeper 会在原网页中跳到缺失位置；加载跟不上时会自动减速或停止。"))) return;
   if (state.status === "paused") await runCapture();
   await updateMissingTimeline();
+  if (!(state.missingRanges || []).length) {
+    alert(t("smartFillNothingMissing", null, "当前没有检测到缺失分片。"));
+    return;
+  }
   smartFillRunning = true;
   paused = false;
+  state.stalled = false;
   state.message = t("smartFillWorking", null, "正在按缺失位置辅助播放；播放器加载慢时会等待。");
   await mirrorJob();
+  startProgressWatchdog();
   try {
-    const ranges = [...(state.missingRanges || [])];
-    for (const range of ranges) {
-      let cursor = Math.max(0, Number(range.startSeconds || 0) - 2);
+    while (smartFillRunning && !paused) {
+      await updateMissingTimeline();
+      const ranges = state.missingRanges || [];
+      if (!ranges.length) break;
+      const range = ranges[0];
+      const remainingRanges = ranges.length;
+      smartFillActiveRange = range;
+      const rangeStart = Number(range.startSeconds || 0);
+      const rangeEnd = Number(range.endSeconds || rangeStart);
+      state.message = t("smartFillRangeWorking", [formatTime(rangeStart), formatTime(rangeEnd), range.count, remainingRanges], `正在补 ${formatTime(rangeStart)} – ${formatTime(rangeEnd)}（${range.count} 项）；还剩 ${remainingRanges} 处缺口。`);
+      await mirrorJob();
+      let cursor = Math.max(0, rangeStart - 2);
       let step = 8;
       let noProgress = 0;
-      while (smartFillRunning && !paused && cursor < Number(range.endSeconds || cursor + 1) + 1) {
+      let skewWarned = false;
+      while (smartFillRunning && !paused && cursor < rangeEnd + 1) {
         const before = Number(state.done || 0);
         const player = await seekVideoAndInspect(Number(candidate.tabId), cursor);
-        if (!player.ok) throw new Error(t("videoElementNotFound", null, "原网页中没有找到可控制的视频播放器，请手动播放到提示位置。"));
+        if (state.captureSpeedMode !== "seek" && Number(state.captureSpeed || 1) > 1) await applyCaptureSpeed();
+        if (!player?.ok) throw new Error(t("videoElementNotFound", null, "原网页中没有找到可控制的视频播放器，请手动播放到提示位置。"));
+        const actual = Number(player.currentTime || 0);
+        const inRange = actual >= rangeStart - SMART_FILL_SEEK_SKEW_SECONDS && actual <= rangeEnd + SMART_FILL_SEEK_SKEW_SECONDS + step;
+        if (!inRange && !skewWarned) {
+          skewWarned = true;
+          const skewMessage = t("smartFillSeekSkew", [formatTime(actual), formatTime(rangeStart), formatTime(rangeEnd)], `播放器停在 ${formatTime(actual)}，与目标缺口 ${formatTime(rangeStart)} – ${formatTime(rangeEnd)} 差距较大。将重试跳转；若反复失败请手动拖到该时间。`);
+          state.message = skewMessage;
+          state.stalled = true;
+          await mirrorJob();
+          alert(skewMessage);
+          state.stalled = false;
+        }
         const loaded = player.readyState >= 2 && (!player.bufferedEnd || player.bufferedEnd >= player.currentTime + 0.5);
         await waitFor(loaded ? 1400 : 3200);
         if (Number(state.done || 0) > before) {
           noProgress = 0;
           step = Math.min(10, step + 1);
+          state.message = t("smartFillRangeWorking", [formatTime(rangeStart), formatTime(rangeEnd), Math.max(1, Number(state.missing || 1)), remainingRanges], `正在补 ${formatTime(rangeStart)} – ${formatTime(rangeEnd)}；还剩 ${remainingRanges} 处缺口。`);
+          await mirrorJob();
         } else {
           noProgress += 1;
           step = Math.max(2, Math.floor(step / 2));
         }
-        if (noProgress >= 5) throw new Error(t("smartFillNoProgress", formatTime(cursor), `在 ${formatTime(cursor)} 附近没有取得新内容，已停止自动跳转。请手动播放这里后继续。`));
+        if (noProgress >= 5) {
+          const stuck = t("smartFillNoProgress", formatTime(actual || cursor), `在 ${formatTime(actual || cursor)} 附近没有取得新内容，已停止自动跳转。请手动播放这里后继续。`);
+          state.stalled = true;
+          throw new Error(stuck);
+        }
+        await updateMissingTimeline();
+        const stillThisRange = (state.missingRanges || []).some((item) => (
+          Number(item.sequenceFrom) <= Number(range.sequenceTo)
+          && Number(item.sequenceTo) >= Number(range.sequenceFrom)
+        ));
+        if (!stillThisRange) break;
         cursor += step;
       }
+      await updateMissingTimeline();
+      const nextRanges = state.missingRanges || [];
+      if (!nextRanges.length) break;
+      const next = nextRanges[0];
+      const sameGap = Number(next.sequenceFrom) === Number(range.sequenceFrom);
+      if (sameGap) {
+        const remainMsg = t("smartFillRangeStillMissing", [formatTime(next.startSeconds), formatTime(next.endSeconds), next.count], `这段缺口仍未补齐（约 ${formatTime(next.startSeconds)} – ${formatTime(next.endSeconds)}，还缺 ${next.count} 项）。请确认网页已播到该时间后再继续。`);
+        state.message = remainMsg;
+        state.stalled = true;
+        await mirrorJob();
+        alert(remainMsg);
+        break;
+      }
+      const nextMsg = t("smartFillNextRange", [formatTime(next.startSeconds), formatTime(next.endSeconds), nextRanges.length, next.count], `本段已处理。下一处缺口约在 ${formatTime(next.startSeconds)} – ${formatTime(next.endSeconds)}（${next.count} 项，共剩 ${nextRanges.length} 处）。将继续自动跳转。`);
+      state.message = nextMsg;
+      await mirrorJob();
+      alert(nextMsg);
     }
     await updateMissingTimeline();
+    smartFillActiveRange = null;
+    state.stalled = Boolean(state.missing);
     state.message = state.missing
       ? t("smartFillStillMissing", state.missing, `自动补全结束，仍有 ${state.missing} 项需要手动播放。`)
       : t("smartFillComplete", null, "缺失位置已经补全，正在检查视频。");
     await mirrorJob();
+    if (state.missing) alert(state.message);
     if (!state.missing && autoFinalize) await mergeOutput(false);
   } catch (error) {
     state.status = "waiting";
+    state.stalled = true;
     state.message = error.message;
     await mirrorJob();
+    alert(error.message);
   } finally {
     smartFillRunning = false;
+    smartFillActiveRange = null;
+    if (paused || !["downloading", "capturing", "waiting"].includes(state?.status)) stopProgressWatchdog();
+    else startProgressWatchdog();
     render();
   }
 }
@@ -2002,6 +2788,295 @@ async function openVideoTab() {
   }
 }
 
+async function readDirectoryFiles(directoryHandle) {
+  const files = [];
+  for await (const [name, handle] of directoryHandle.entries()) {
+    if (handle.kind === "file") files.push({ name, handle });
+  }
+  return files;
+}
+
+async function readDirectoryDirs(directoryHandle) {
+  const dirs = [];
+  for await (const [name, handle] of directoryHandle.entries()) {
+    if (handle.kind === "directory") dirs.push({ name, handle });
+  }
+  return dirs;
+}
+
+function legacySequenceFromName(name) {
+  const match = String(name || "").match(/(?:^|[_\-.])(\d{1,10})\.ts$/i) || String(name || "").match(/(\d{1,10})/);
+  return match ? Number(match[1]) : null;
+}
+
+async function directoryLooksLikeVariant(directoryHandle) {
+  for await (const [name, handle] of directoryHandle.entries()) {
+    if (handle.kind === "file" && /\.ts$/i.test(name)) return true;
+  }
+  return false;
+}
+
+async function collectLegacyVariants(directoryHandle) {
+  if (await directoryLooksLikeVariant(directoryHandle)) {
+    const parentName = directoryHandle.name || "video";
+    const resolution = /^\d{2,5}x\d{2,5}$/i.test(parentName) ? parentName : "auto";
+    return [{ product: resolution === "auto" ? parentName : "imported", resolution, handle: directoryHandle, label: parentName }];
+  }
+  const variants = [];
+  const children = await readDirectoryDirs(directoryHandle);
+  for (const child of children) {
+    if (await directoryLooksLikeVariant(child.handle)) {
+      variants.push({
+        product: directoryHandle.name || "imported",
+        resolution: child.name,
+        handle: child.handle,
+        label: `${directoryHandle.name}/${child.name}`
+      });
+      continue;
+    }
+    const grandchildren = await readDirectoryDirs(child.handle);
+    for (const grand of grandchildren) {
+      if (await directoryLooksLikeVariant(grand.handle)) {
+        variants.push({
+          product: child.name,
+          resolution: grand.name,
+          handle: grand.handle,
+          label: `${child.name}/${grand.name}`
+        });
+      }
+    }
+  }
+  return variants;
+}
+
+function rewriteLegacyPlaylistKey(text, keyUrl) {
+  return String(text || "").replace(/#EXT-X-KEY:([^\r\n]+)/g, (full, attrs) => {
+    if (!/METHOD=AES-128/i.test(attrs)) return full;
+    if (/URI="/i.test(attrs)) return `#EXT-X-KEY:${attrs.replace(/URI="[^"]*"/i, `URI="${keyUrl}"`)}`;
+    return `#EXT-X-KEY:${attrs},URI="${keyUrl}"`;
+  });
+}
+
+function buildSyntheticLegacyPlaylist(fileNames, duration = 2.002, keyUrl = "", iv = "") {
+  const numbered = fileNames
+    .map((name) => ({ name, sequence: legacySequenceFromName(name) }))
+    .filter((item) => item.sequence != null)
+    .sort((a, b) => a.sequence - b.sequence);
+  const lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:3", "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"];
+  if (keyUrl) lines.push(`#EXT-X-KEY:METHOD=AES-128,URI="${keyUrl}"${iv ? `,IV=${iv}` : ""}`);
+  for (const item of numbered) {
+    lines.push(`#EXTINF:${duration},`);
+    lines.push(item.name);
+  }
+  lines.push("#EXT-X-ENDLIST");
+  return { text: `${lines.join("\n")}\n`, sequences: numbered };
+}
+
+async function ensureImportWorkspace(jobId) {
+  const uiSettings = await chrome.storage.local.get({ saveDestination: "browser-downloads" });
+  saveDestination = uiSettings.saveDestination === "custom-folder" ? "custom-folder" : "browser-downloads";
+  if (saveDestination === "browser-downloads") {
+    if (!navigator.storage?.getDirectory) throw new Error(t("browserStorageUnavailable", null, "浏览器无法提供扩展内部下载空间。"));
+    rootHandle = await navigator.storage.getDirectory();
+  } else {
+    const handleRecord = await dbGet("handles", "default-root");
+    rootHandle = handleRecord?.handle || null;
+    if (!rootHandle) throw new Error(t("selectFolderFirst", null, "请先在设置里选择保存位置，或改回浏览器 Downloads。"));
+  }
+  await dbPut("handles", { id: jobId, handle: rootHandle });
+}
+
+async function importLegacyVariant(variant, { onProgress } = {}) {
+  let product = safeName(variant.product, "imported");
+  const resolution = safeName(variant.resolution, "auto");
+  if (product === "imported" && /^\d{2,5}x\d{2,5}$/i.test(resolution)) {
+    const typed = window.prompt(t("legacyAskProduct", null, "你选的是清晰度文件夹。请输入作品名（例如 ofje00435）："), "");
+    if (typed && typed.trim()) product = safeName(typed.trim(), "imported");
+  }
+  const candidateId = `legacy:${product}:${resolution}`;
+  const jobId = `job:${candidateId}:direct`;
+  const existing = await dbGet("states", jobId);
+  if (existing?.source === "legacy-import" && Number(existing.done || 0) > 0) {
+    return { jobId, skipped: true, product, resolution, done: existing.done, total: existing.total };
+  }
+
+  const files = await readDirectoryFiles(variant.handle);
+  const tsFiles = files.filter((item) => /\.ts$/i.test(item.name));
+  if (!tsFiles.length) throw new Error(t("legacyNoSegments", variant.label, `目录 ${variant.label} 里没有找到 .ts 分片。`));
+
+  const playlistFile = files.find((item) => /^(first|index|playlist|source)\.m3u8$/i.test(item.name)) || files.find((item) => /\.m3u8$/i.test(item.name));
+  const keyFile = files.find((item) => /^file\.key$/i.test(item.name));
+  const legacyKeyUrl = `https://legacy.local/aes-key/${encodeURIComponent(candidateId)}`;
+  let playlistText = "";
+  if (playlistFile) playlistText = await (await playlistFile.handle.getFile()).text();
+  else {
+    playlistText = buildSyntheticLegacyPlaylist(tsFiles.map((item) => item.name), 2.002, keyFile ? legacyKeyUrl : "").text;
+  }
+  if (keyFile) playlistText = rewriteLegacyPlaylistKey(playlistText, legacyKeyUrl);
+
+  const baseUrl = `https://legacy.local/${encodeURIComponent(product)}/${encodeURIComponent(resolution)}/source.m3u8`;
+  const parsed = parsePlaylist(playlistText, baseUrl);
+  if (!parsed.segments.length) throw new Error(t("legacyPlaylistEmpty", variant.label, `无法从 ${variant.label} 解析分片列表。`));
+  if (keyFile) {
+    await cacheLegacyAesKey(await (await keyFile.handle.getFile()).arrayBuffer(), legacyKeyUrl);
+    for (const segment of parsed.segments) {
+      if (segment.key) segment.key = { ...segment.key, url: legacyKeyUrl };
+    }
+  }
+
+  const byName = new Map(tsFiles.map((item) => [item.name.toLowerCase(), item]));
+  const importable = parsed.segments.filter((segment) => {
+    let name = "";
+    try { name = decodeURIComponent(new URL(segment.url).pathname.split("/").pop() || ""); } catch { name = ""; }
+    return byName.has(name.toLowerCase());
+  });
+  if (!importable.length) throw new Error(t("legacySegmentsUnmatched", variant.label, `${variant.label} 的播放列表与目录中的分片对不上。`));
+
+  await ensureImportWorkspace(jobId);
+  state = {
+    id: jobId,
+    candidateId,
+    candidate: null,
+    mode: "direct",
+    product,
+    title: product,
+    resolution,
+    status: "downloading",
+    done: 0,
+    total: parsed.segments.filter((item) => !item.gap).length,
+    bytes: 0,
+    failed: 0,
+    providerId: "hls",
+    progressUnit: "items",
+    source: "legacy-import",
+    legacyKeyUrl: keyFile ? legacyKeyUrl : "",
+    saveDestination,
+    message: t("legacyImportWorking", [product, resolution], `正在导入旧捕获 ${product} / ${resolution}…`)
+  };
+  candidate = {
+    id: candidateId,
+    product,
+    resolution,
+    pageTitle: product,
+    pageUrl: "",
+    tabId: -1,
+    playlistUrl: baseUrl,
+    playlistUrls: [baseUrl],
+    headers: {},
+    subtitles: [],
+    decision: "direct",
+    providerHint: "hls"
+  };
+  state.candidate = { ...candidate };
+  await ensureDirectories({ requestPermission: true });
+  await writeFile(workDirectory, "source.m3u8", playlistText);
+  if (keyFile) await writeFile(workDirectory, "file.key", await (await keyFile.handle.getFile()).arrayBuffer());
+
+  indexMediaPlaylist(parsed);
+  let imported = 0;
+  let bytes = 0;
+  for (const [index, segment] of importable.entries()) {
+    let name = "";
+    try { name = decodeURIComponent(new URL(segment.url).pathname.split("/").pop() || ""); } catch { name = ""; }
+    const source = byName.get(name.toLowerCase());
+    if (!source) continue;
+    const existingSegment = await savedSegment(segment.sequence);
+    if (existingSegment?.skipped) continue;
+    if (existingSegment) {
+      imported += 1;
+      bytes += Number(existingSegment.size || 0);
+    } else {
+      const encrypted = await (await source.handle.getFile()).arrayBuffer();
+      const decrypted = await decryptIfNeeded(segment, encrypted);
+      if (!isValidSegmentSize(decrypted.byteLength)) {
+        await maybeMarkSkippable(segment, { tinySize: decrypted.byteLength });
+        continue;
+      }
+      const fileName = segmentFileName(segment);
+      await writeFile(segmentDirectory, fileName, decrypted);
+      const record = {
+        id: `${jobId}:${segment.sequence}`,
+        jobId,
+        sequence: segment.sequence,
+        fileName,
+        size: decrypted.byteLength,
+        url: segment.url,
+        savedAt: Date.now(),
+        source: "legacy-import"
+      };
+      await dbPut("segments", record);
+      imported += 1;
+      bytes += decrypted.byteLength;
+    }
+    state.done = imported;
+    state.bytes = bytes;
+    if (index % 12 === 0 || index === importable.length - 1) {
+      state.message = t("legacyImportProgress", [imported, importable.length, product, resolution], `已导入 ${imported}/${importable.length} · ${product} / ${resolution}`);
+      await mirrorJob();
+      if (onProgress) onProgress(state);
+      await waitFor(0);
+    }
+  }
+
+  try {
+    const subtitleSource = await variant.handle.getDirectoryHandle("subtitles");
+    const target = await workDirectory.getDirectoryHandle("subtitles", { create: true });
+    let subtitleCount = 0;
+    const walk = async (dir, prefix = "") => {
+      for await (const [name, handle] of dir.entries()) {
+        if (handle.kind === "directory") {
+          await walk(handle, `${prefix}${name}/`);
+          continue;
+        }
+        if (!/\.(vtt|srt|ttml|dfxp|ass|ssa)$/i.test(name)) continue;
+        const data = await (await handle.getFile()).arrayBuffer();
+        await writeFile(target, safeName(`${prefix.replace(/\//g, "_")}${name}`, `subtitle-${subtitleCount + 1}.vtt`), data);
+        subtitleCount += 1;
+      }
+    };
+    await walk(subtitleSource);
+    state.subtitlesSaved = subtitleCount;
+  } catch { /* no local subtitles */ }
+
+  await reclassifySkippableGaps();
+  await updateMissingTimeline();
+  const missing = Number(state.missing || 0);
+  const skipped = Number(state.skippableCount || 0);
+  state.status = missing ? "paused" : "downloaded";
+  state.message = missing
+    ? t("legacyImportMissing", [imported, missing], `已导入 ${imported} 个分片，仍有 ${missing} 处缺口。打开原网页播放后可用网页辅助/智能补全继续；分片齐了再生成视频。`)
+      + (skipped ? ` ${t("skippableSegmentsNote", skipped, `已确认 ${skipped} 个空壳/可跳过分片（前后时间轴连贯，不再重试）。`)}` : "")
+    : t("legacyImportReady", imported, `已导入 ${imported} 个分片，可直接检查并生成视频。字幕与播放加速/智能补全在绑定原网页后仍可使用。`)
+      + (skipped ? ` ${t("skippableSegmentsNote", skipped, `已确认 ${skipped} 个空壳/可跳过分片（前后时间轴连贯，不再重试）。`)}` : "");
+  const storedCandidates = await chrome.storage.local.get({ [CANDIDATES_KEY]: [] });
+  const candidateList = Array.isArray(storedCandidates[CANDIDATES_KEY]) ? storedCandidates[CANDIDATES_KEY] : [];
+  const candidateIndex = candidateList.findIndex((item) => item.id === candidateId);
+  if (candidateIndex >= 0) candidateList[candidateIndex] = { ...candidateList[candidateIndex], ...candidate };
+  else candidateList.unshift(candidate);
+  await chrome.storage.local.set({ [CANDIDATES_KEY]: candidateList.slice(0, 100) });
+  await mirrorJob();
+  return { jobId, skipped: false, product, resolution, done: imported, total: state.total, missing };
+}
+
+async function importLegacyCapture() {
+  if (!window.showDirectoryPicker) throw new Error(t("directoryPickerUnavailable", null, "当前浏览器不支持选择文件夹。"));
+  const directory = await window.showDirectoryPicker({ id: "web-keeper-legacy-import", mode: "read" });
+  const variants = await collectLegacyVariants(directory);
+  if (!variants.length) throw new Error(t("legacyFolderUnrecognized", null, "没有识别到旧捕获目录。请选择 data\\\\captures、作品文件夹，或具体清晰度文件夹（内含 .ts）。"));
+  $("taskView").hidden = false;
+  $("listView").hidden = true;
+  $("notice").className = "notice";
+  $("notice").textContent = t("legacyImportStarting", variants.length, `准备导入 ${variants.length} 个旧清晰度目录…`);
+  $("status").textContent = t("legacyImportStatus", null, "正在导入旧捕获");
+  const results = [];
+  for (const variant of variants) {
+    results.push(await importLegacyVariant(variant));
+  }
+  const first = results.find((item) => !item.skipped) || results[0];
+  if (first?.jobId) location.href = `download.html?job=${encodeURIComponent(first.jobId)}`;
+  else await showTaskList();
+}
+
 async function showTaskList() {
   $("taskView").hidden = true;
   $("listView").hidden = false;
@@ -2009,8 +3084,9 @@ async function showTaskList() {
   const stored = await chrome.storage.local.get({ [JOBS_KEY]: [], [CANDIDATES_KEY]: [] });
   const jobs = stored[JOBS_KEY] || [];
   const candidates = stored[CANDIDATES_KEY] || [];
+  const importBar = `<div class="actions" style="margin:12px 0 4px"><button id="importLegacy" class="primary">${escapeHtml(t("importLegacyCapture", null, "导入旧捕获目录"))}</button><span class="muted">${escapeHtml(t("importLegacyCaptureHint", null, "选择 data\\\\captures、作品夹或清晰度文件夹，继续补洞/生成视频。"))}</span></div>`;
   if (!jobs.length && !candidates.length) {
-    $("taskList").innerHTML = `<div class="muted">${t("noDownloadTasks", null, "还没有下载。打开监听并播放视频后，从扩展创建任务。")}</div>`;
+    $("taskList").innerHTML = `${importBar}<div class="muted">${t("noDownloadTasks", null, "还没有下载。打开监听并播放视频后，从扩展创建任务；也可导入旧的 data\\\\captures 目录。")}</div>`;
   } else {
     const groups = new Map();
     const candidateById = new Map(candidates.map((item) => [item.id, item]));
@@ -2030,7 +3106,7 @@ async function showTaskList() {
       if (!groups.has(key)) groups.set(key, { title: job.title || job.product, product: job.product, candidates: [], jobs: [] });
       groups.get(key).jobs.push(job);
     }
-    $("taskList").innerHTML = [...groups.values()].map((work) => {
+    $("taskList").innerHTML = importBar + [...groups.values()].map((work) => {
       const resolutions = Array.from(new Set([...work.candidates.map((item) => item.resolution), ...work.jobs.map((item) => item.resolution)].filter(Boolean)));
       const subtitleCount = new Set(work.candidates.flatMap((item) => item.subtitles || [])).size;
       const latestJob = [...work.jobs].sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0];
@@ -2110,6 +3186,16 @@ async function initialize() {
     try {
       await ensureDirectories({ requestPermission: false });
       await reconcileSaved();
+      if (state.source === "legacy-import" || state.providerId === "hls" || state.providerId === "browser-assisted") {
+        try {
+          if (!mediaPlaylist) await loadMediaPlaylist();
+          await prepareTimelineAfterIdle({ reason: "reopen" });
+          await updateMissingTimeline();
+        } catch (error) {
+          if (state.source === "legacy-import") log(`旧捕获播放列表恢复失败：${error.message}`);
+          else log(`重新打开任务时时间轴复核跳过：${error.message}`);
+        }
+      }
       if (state.outputName && state.status === "complete" && !state.validationVersion && !state.outputInternalDeleted) {
         try {
           const legacyOutput = await workDirectory.getFileHandle(state.outputName);
@@ -2138,6 +3224,11 @@ $("pause").addEventListener("click", () => void pauseTask());
 $("backToVideo").addEventListener("click", () => void openVideoTab());
 $("switchAssisted").addEventListener("click", () => void switchToAssisted());
 $("smartFill").addEventListener("click", () => void smartFillMissing());
+$("captureSpeed").addEventListener("change", (event) => void changeCaptureSpeed(event.target.value));
+$("seekBoostInterval").addEventListener("change", () => void applySeekBoostSettingsFromInputs());
+$("seekBoostStep").addEventListener("change", () => void applySeekBoostSettingsFromInputs());
+$("seekBoostInterval").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void applySeekBoostSettingsFromInputs(); } });
+$("seekBoostStep").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void applySeekBoostSettingsFromInputs(); } });
 $("merge").addEventListener("click", () => void finalizeDownloadedTask());
 $("openOutput").addEventListener("click", () => void openGeneratedVideo());
 $("subtitles").addEventListener("click", () => void saveSubtitles());
@@ -2145,6 +3236,16 @@ $("deleteSegments").addEventListener("click", () => void deleteTaskSegments());
 $("deleteOutput").addEventListener("click", () => void deleteOutput());
 $("removeTask").addEventListener("click", () => void removeTask());
 $("taskList").addEventListener("click", (event) => {
+  const importButton = event.target.closest("#importLegacy, #importLegacyEmpty");
+  if (importButton) {
+    void importLegacyCapture().catch((error) => {
+      $("taskView").hidden = true;
+      $("listView").hidden = false;
+      $("taskList").insertAdjacentHTML("afterbegin", `<div class="notice bad">${escapeHtml(error.message)}</div>`);
+      log(error.stack || error.message);
+    });
+    return;
+  }
   const button = event.target.closest("button[data-remove-job]");
   if (button) void removeTask(decodeURIComponent(button.dataset.removeJob));
   const createButton = event.target.closest("button[data-new-candidate]");

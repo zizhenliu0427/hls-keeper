@@ -25,12 +25,16 @@
     .stat strong { display:block; font-size:18px; }
     progress { width:100%; height:13px; margin:15px 0 5px; accent-color:var(--blue); }
     .actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:14px; }
+    .speed { display:inline-flex; align-items:center; gap:7px; padding:0 11px; border:1px solid var(--line); border-radius:9px; background:var(--card); font-weight:650; }
+    .speed select { appearance:none; border:0; background:transparent; color:var(--text); font:inherit; font-weight:650; padding:9px 0; cursor:pointer; }
+    .speed input[type="number"] { width:4.2em; border:1px solid var(--line); border-radius:6px; background:var(--soft); color:var(--text); font:inherit; font-weight:650; padding:4px 6px; }
     button, .button { appearance:none; display:inline-flex; align-items:center; justify-content:center; padding:9px 13px; border:1px solid var(--line); border-radius:9px; color:var(--text); background:var(--card); cursor:pointer; font:inherit; font-weight:650; text-decoration:none; }
     button.primary { color:white; background:var(--blue); border-color:var(--blue); }
     button.danger { color:var(--red); }
     button:disabled { opacity:.55; cursor:not-allowed; }
     .notice { margin-top:14px; padding:11px 13px; border-radius:9px; background:var(--soft); border:1px solid var(--line); }
-    .notice.bad { color:var(--red); }
+    .notice.bad { color:var(--red); border-color:color-mix(in srgb, var(--red) 55%, var(--line)); background:color-mix(in srgb, var(--red) 10%, var(--soft)); font-weight:650; }
+    .range.active { border-color:var(--blue); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--blue) 35%, transparent); }
     .log { max-height:240px; overflow:auto; background:#0b1220; color:#cbd5e1; border-radius:9px; padding:11px; font:12px/1.55 Consolas,monospace; white-space:pre-wrap; }
     details summary { cursor:pointer; font-weight:700; } details .muted { margin:6px 0 10px; }
     nav { display:flex; align-items:center; gap:8px; }
@@ -71,6 +75,23 @@
         <button id="backToVideo" hidden data-i18n="returnToVideo">返回网页继续播放</button>
         <button id="switchAssisted" hidden data-i18n="switchToAssisted">改用网页辅助</button>
         <button id="smartFill" hidden data-i18n="smartFill">智能补全缺失位置</button>
+        <label id="captureSpeedPanel" class="speed" hidden><span data-i18n="captureSpeed">播放加速</span>
+          <select id="captureSpeed">
+            <option value="1" data-i18n="captureSpeedNormal">正常速度</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+            <option value="8">8x</option>
+            <option value="seek10" data-i18n="captureSeekBoost">自动快进</option>
+          </select>
+        </label>
+        <label id="seekBoostPanel" class="speed" hidden>
+          <span data-i18n="captureSeekEvery">每</span>
+          <input id="seekBoostInterval" type="number" min="0.25" max="30" step="0.25" value="1" title="seconds">
+          <span data-i18n="captureSeekSeconds">秒</span>
+          <span data-i18n="captureSeekJump">快进</span>
+          <input id="seekBoostStep" type="number" min="1" max="120" step="1" value="10" title="seconds">
+          <span data-i18n="captureSeekSeconds">秒</span>
+        </label>
         <button id="merge" hidden data-i18n="checkAndCreateVideo">检查并生成视频</button>
         <button id="openOutput" hidden data-i18n="openGeneratedVideo">打开生成的视频</button>
         <button id="subtitles" hidden data-i18n="saveSubtitles">保存字幕</button>

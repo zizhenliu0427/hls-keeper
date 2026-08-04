@@ -349,14 +349,31 @@
     collectProtection(period);
     const drm = protectionNodes.some((node) => /widevine|playready|fairplay|edef8ba9|9a04f079|urn:uuid/i.test(`${node.attrs.schemeIdUri || ""} ${node.attrs.value || ""}`));
     const tracks = [];
+    const subtitles = [];
     const manifestBaseUrl = inheritedBaseUrl(manifestUrl, mpd);
     for (const adaptation of xmlChildren(period, "AdaptationSet")) {
+      const adaptationAttrs = adaptation.attrs || {};
+      const isText = adaptationAttrs.contentType === "text" || /^text\//i.test(adaptationAttrs.mimeType || "");
+      if (isText) {
+        for (const representationNode of xmlChildren(adaptation, "Representation")) {
+          const attrs = { ...adaptationAttrs, ...(representationNode.attrs || {}) };
+          // Segmented text (stpp/wvtt in fMP4) needs an extractor we do not have; only whole files are usable.
+          if (inheritedTemplate(period, adaptation, representationNode) || xmlChild(representationNode, "SegmentList") || xmlChild(adaptation, "SegmentList")) {
+            subtitles.push({ url: "", language: attrs.lang || "und", label: attrs.id || "", mimeType: attrs.mimeType || "", segmented: true });
+            continue;
+          }
+          const url = inheritedBaseUrl(manifestBaseUrl, period, adaptation, representationNode);
+          if (url === manifestBaseUrl) continue;
+          subtitles.push({ url, language: attrs.lang || "und", label: attrs.id || "", mimeType: attrs.mimeType || "", segmented: false });
+        }
+        continue;
+      }
       for (const representationNode of xmlChildren(adaptation, "Representation")) {
         const track = dashTrackFromRepresentation({ representationNode, adaptationNode: adaptation, periodNode: period, manifestUrl: manifestBaseUrl, periodDuration: duration });
         if (track.segments.length || track.initializationUrl) tracks.push(track);
       }
     }
-    return { url: manifestUrl, text, type: mpd.attrs.type || "static", duration, minimumUpdatePeriod: isoDurationSeconds(mpd.attrs.minimumUpdatePeriod || ""), drm, tracks };
+    return { url: manifestUrl, text, type: mpd.attrs.type || "static", duration, minimumUpdatePeriod: isoDurationSeconds(mpd.attrs.minimumUpdatePeriod || ""), drm, tracks, subtitles };
   }
 
   function selectDashTracks(manifest, preferredHeight = 0) {
@@ -692,9 +709,10 @@
     return { tracks, find, track };
   }
 
-  function missingTimeline(segments, savedSequences) {
+  function missingTimeline(segments, savedSequences, skippableSequences) {
     const saved = savedSequences instanceof Set ? savedSequences : new Set(savedSequences || []);
-    const missing = (segments || []).filter((item) => !item.gap && !saved.has(item.sequence)).sort((a, b) => a.sequence - b.sequence);
+    const skippable = skippableSequences instanceof Set ? skippableSequences : new Set(skippableSequences || []);
+    const missing = (segments || []).filter((item) => !item.gap && !saved.has(item.sequence) && !skippable.has(item.sequence)).sort((a, b) => a.sequence - b.sequence);
     const ranges = [];
     for (const segment of missing) {
       const previous = ranges[ranges.length - 1];
@@ -707,6 +725,151 @@
       }
     }
     return ranges;
+  }
+
+  function findTsSync(source) {
+    const bytes = source instanceof Uint8Array ? source : new Uint8Array(source || 0);
+    const limit = Math.min(bytes.byteLength, 188);
+    for (let offset = 0; offset < limit; offset += 1) {
+      if (bytes[offset] !== 0x47) continue;
+      if (offset + 376 <= bytes.byteLength && bytes[offset + 188] === 0x47 && bytes[offset + 376] === 0x47) return offset;
+      if (offset + 188 <= bytes.byteLength && bytes[offset + 188] === 0x47) return offset;
+      if (offset + 188 <= bytes.byteLength) return offset;
+    }
+    return -1;
+  }
+
+  function readPts33(bytes, offset) {
+    if (offset + 5 > bytes.byteLength) return null;
+    const pts = (
+      ((bytes[offset] >> 1) & 0x07) * 0x40000000
+      + (bytes[offset + 1] << 22)
+      + (((bytes[offset + 2] >> 1) & 0x7f) << 15)
+      + (bytes[offset + 3] << 7)
+      + ((bytes[offset + 4] >> 1) & 0x7f)
+    );
+    return Number.isFinite(pts) ? pts : null;
+  }
+
+  function readPcrBase(bytes, packetOffset) {
+    const flags = bytes[packetOffset + 3];
+    const adaptation = (flags >> 4) & 3;
+    if (adaptation !== 2 && adaptation !== 3) return null;
+    const adaptationLength = bytes[packetOffset + 4];
+    if (!adaptationLength || packetOffset + 5 >= bytes.byteLength) return null;
+    const adaptationFlags = bytes[packetOffset + 5];
+    if (!(adaptationFlags & 0x10) || packetOffset + 11 >= bytes.byteLength) return null;
+    return (
+      bytes[packetOffset + 6] * 0x2000000
+      + bytes[packetOffset + 7] * 0x20000
+      + bytes[packetOffset + 8] * 0x200
+      + bytes[packetOffset + 9] * 2
+      + (bytes[packetOffset + 10] >> 7)
+    );
+  }
+
+  function transportTimestamps(input) {
+    const source = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+    const sync = findTsSync(source);
+    if (sync < 0) return { ok: false, firstPts: null, lastPts: null, firstPcr: null, lastPcr: null, ptsCount: 0 };
+    const bytes = source.subarray(sync);
+    let firstPts = null;
+    let lastPts = null;
+    let firstPcr = null;
+    let lastPcr = null;
+    let ptsCount = 0;
+    for (let offset = 0; offset + 188 <= bytes.byteLength; offset += 188) {
+      if (bytes[offset] !== 0x47) break;
+      const pcr = readPcrBase(bytes, offset);
+      if (pcr != null) {
+        if (firstPcr == null) firstPcr = pcr;
+        lastPcr = pcr;
+      }
+      if (!(bytes[offset + 1] & 0x40)) continue;
+      const payload = transportPayload(bytes, offset);
+      if (payload == null || payload + 9 > offset + 188) continue;
+      if (bytes[payload] !== 0x00 || bytes[payload + 1] !== 0x00 || bytes[payload + 2] !== 0x01) continue;
+      const streamId = bytes[payload + 3];
+      if (streamId < 0xbd || streamId === 0xbe || streamId === 0xbf || streamId === 0xf0) continue;
+      const ptsDtsFlags = (bytes[payload + 7] >> 6) & 0x03;
+      if (ptsDtsFlags !== 2 && ptsDtsFlags !== 3) continue;
+      const pts = readPts33(bytes, payload + 9);
+      if (pts == null) continue;
+      if (firstPts == null) firstPts = pts;
+      lastPts = pts;
+      ptsCount += 1;
+    }
+    return { ok: firstPts != null || firstPcr != null, firstPts, lastPts, firstPcr, lastPcr, ptsCount };
+  }
+
+  function ptsDeltaSeconds(fromPts, toPts) {
+    if (fromPts == null || toPts == null || !Number.isFinite(fromPts) || !Number.isFinite(toPts)) return null;
+    let delta = Number(toPts) - Number(fromPts);
+    const MOD = 0x200000000; // 2^33
+    if (delta < -MOD / 2) delta += MOD;
+    if (delta > MOD / 2) delta -= MOD;
+    return delta / 90000;
+  }
+
+  function assessSkippedSegmentContinuity({
+    previousLastPts = null,
+    nextFirstPts = null,
+    previousLastPcr = null,
+    nextFirstPcr = null,
+    expectedDurationSeconds = 0
+  } = {}) {
+    const expected = Math.max(0.05, Number(expectedDurationSeconds) || 0);
+    let deltaSeconds = ptsDeltaSeconds(previousLastPts, nextFirstPts);
+    let clock = "pts";
+    if (deltaSeconds == null) {
+      deltaSeconds = ptsDeltaSeconds(previousLastPcr, nextFirstPcr);
+      clock = "pcr";
+    }
+    if (deltaSeconds == null) return { status: "unknown", reason: "NO_TIMESTAMPS", deltaSeconds: null, expectedSeconds: expected, clock };
+    // Neighbors already abut: the skipped slice carried no media timeline.
+    if (deltaSeconds <= Math.max(0.35, expected * 0.25)) {
+      return { status: "skippable", reason: "NEIGHBORS_CONTINUOUS", deltaSeconds, expectedSeconds: expected, clock };
+    }
+    // Gap roughly matches the playlist duration for the skipped item: real content is missing.
+    if (Math.abs(deltaSeconds - expected) <= Math.max(0.75, expected * 0.4)) {
+      return { status: "needed", reason: "GAP_MATCHES_DURATION", deltaSeconds, expectedSeconds: expected, clock };
+    }
+    if (deltaSeconds > Math.max(expected * 0.5, 0.8)) {
+      return { status: "needed", reason: "GAP_TOO_LARGE", deltaSeconds, expectedSeconds: expected, clock };
+    }
+    return { status: "unknown", reason: "AMBIGUOUS_GAP", deltaSeconds, expectedSeconds: expected, clock };
+  }
+
+  function assessAdjacentSegmentContinuity({
+    previousLastPts = null,
+    nextFirstPts = null,
+    previousLastPcr = null,
+    nextFirstPcr = null,
+    previousDurationSeconds = 0,
+    playlistDiscontinuity = false
+  } = {}) {
+    if (playlistDiscontinuity) return { status: "ok", reason: "PLAYLIST_DISCONTINUITY", deltaSeconds: null, expectedSeconds: Number(previousDurationSeconds) || 0, clock: null };
+    const expected = Math.max(0.05, Number(previousDurationSeconds) || 0);
+    let deltaSeconds = ptsDeltaSeconds(previousLastPts, nextFirstPts);
+    let clock = "pts";
+    if (deltaSeconds == null) {
+      deltaSeconds = ptsDeltaSeconds(previousLastPcr, nextFirstPcr);
+      clock = "pcr";
+    }
+    if (deltaSeconds == null) return { status: "unknown", reason: "NO_TIMESTAMPS", deltaSeconds: null, expectedSeconds: expected, clock };
+    // Normal join: slight overlap/backstep or a short forward step is fine.
+    if (deltaSeconds >= -0.75 && deltaSeconds <= Math.max(1.25, expected * 0.4)) {
+      return { status: "ok", reason: "CONTINUOUS", deltaSeconds, expectedSeconds: expected, clock };
+    }
+    // New session / re-encode often resets PTS near zero relative to the previous tail.
+    if (deltaSeconds < -1.5) {
+      return { status: "shifted", reason: "PTS_RESET_OR_JUMP_BACK", deltaSeconds, expectedSeconds: expected, clock };
+    }
+    // A forward jump far beyond the previous segment duration means the clocks no longer match.
+    if (deltaSeconds > Math.max(expected * 1.8, expected + 2.5, 3)) {
+      return { status: "shifted", reason: "PTS_FORWARD_JUMP", deltaSeconds, expectedSeconds: expected, clock };
+    }
+    return { status: "unknown", reason: "AMBIGUOUS_JOIN", deltaSeconds, expectedSeconds: expected, clock };
   }
 
   function mp4TrackTypes(bytes) {
@@ -891,7 +1054,8 @@
     parseAttributeList, normalizeByteRange, rangeHeader, parseHlsPlaylist,
     isoDurationSeconds, expandDashTimeline, parseDashManifest, selectDashTracks,
     mp4Boxes, concatBytes, makeMp4Box, mergeCmafInitializations, patchCmafFragmentTrackId, patchMp4InitDuration,
-    mp4TrackTypes, inspectTransportStream, inspectMediaBytes,
+    mp4TrackTypes, inspectTransportStream, inspectMediaBytes, transportTimestamps,
+    ptsDeltaSeconds, assessSkippedSegmentContinuity, assessAdjacentSegmentContinuity,
     classifyMediaError, missingTimeline, normalizeMediaUrl, sequenceFromUrl, segmentLookup, dashCaptureIndex, mergeDashCaptureTracks,
     extensionFromUrl, extensionForCandidate, directFile, directFileUrl
   };
