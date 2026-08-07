@@ -602,7 +602,7 @@ console.log(JSON.stringify({
         source = r"""
 const e = require('./extension/media-engine.js');
 const refs = [{ size: 1000, duration: 180000 }, { size: 2500, duration: 90000 }, { size: 4096, duration: 90000 }];
-const box = e.buildSidx(refs, { timescale: 90000 });
+const box = e.buildSidx(refs, { timescale: 90000, firstOffset: 252 });
 const view = new DataView(box.buffer, box.byteOffset, box.byteLength);
 const parsed = [];
 const count = view.getUint16(38);
@@ -613,6 +613,8 @@ for (let i = 0; i < count; i += 1) {
   parsed.push({ type: word >>> 31, size: word & 0x7fffffff, duration: view.getUint32(at + 4), sap: flags >>> 31, sapType: (flags >>> 28) & 7 });
 }
 const free = e.buildFreeBox(64);
+const plain = e.buildSidx(refs);
+const plainView = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
 console.log(JSON.stringify({
   name: String.fromCharCode.apply(null, Array.from(box.subarray(4, 8))),
   declared: view.getUint32(0),
@@ -620,6 +622,8 @@ console.log(JSON.stringify({
   helper: e.sidxByteLength(refs.length),
   version: view.getUint8(8),
   timescale: view.getUint32(16),
+  firstOffset: Number(view.getBigUint64(28)),
+  defaultFirstOffset: Number(plainView.getBigUint64(28)),
   count,
   parsed,
   freeName: String.fromCharCode.apply(null, Array.from(free.subarray(4, 8))),
@@ -633,6 +637,9 @@ console.log(JSON.stringify({
         self.assertEqual(40 + 3 * 12, result["actual"])
         self.assertEqual(1, result["version"])
         self.assertEqual(90000, result["timescale"])
+        # Export pads a free box after sidx; first_offset must be that gap, not always 0.
+        self.assertEqual(252, result["firstOffset"])
+        self.assertEqual(0, result["defaultFirstOffset"])
         self.assertEqual(3, result["count"])
         self.assertEqual([1000, 2500, 4096], [item["size"] for item in result["parsed"]])
         self.assertEqual([180000, 90000, 90000], [item["duration"] for item in result["parsed"]])

@@ -437,7 +437,7 @@
 
   // ISO/IEC 14496-12 sidx. One reference per fragment: its byte size and its duration, so a
   // player can map a timestamp to a file offset without reading anything in between.
-  function buildSidx(references, { timescale = 90000, referenceId = 1, earliestPresentationTime = 0 } = {}) {
+  function buildSidx(references, { timescale = 90000, referenceId = 1, earliestPresentationTime = 0, firstOffset = 0 } = {}) {
     const count = references.length;
     const bytes = new Uint8Array(sidxByteLength(count));
     const view = new DataView(bytes.buffer);
@@ -447,7 +447,9 @@
     view.setUint32(12, referenceId);
     view.setUint32(16, timescale);
     view.setBigUint64(20, BigInt(Math.max(0, Math.round(earliestPresentationTime))));
-    view.setBigUint64(28, 0n);                         // first_offset: fragments follow immediately
+    // Distance from the end of this sidx to the first referenced subsegment. When a trailing
+    // free box pads a reserved slot, that gap must be counted; 0 only means moof follows next.
+    view.setBigUint64(28, BigInt(Math.max(0, Math.round(firstOffset))));
     view.setUint16(36, 0);                             // reserved
     view.setUint16(38, count);
     references.forEach((reference, index) => {

@@ -798,15 +798,18 @@ function render() {
 async function writeSegmentIndex(writable, { sidxPosition, sidxCapacity, fragmentSizes, fragmentDurations }) {
   if (!(sidxPosition >= 0) || !fragmentSizes.length) return;
   const references = fragmentSizes.map((size, index) => ({ size, duration: fragmentDurations[index] || 0 }));
-  const sidx = WebKeeperMediaEngine.buildSidx(references);
-  if (sidx.byteLength > sidxCapacity) {
+  if (WebKeeperMediaEngine.sidxByteLength(references.length) > sidxCapacity) {
     // Fewer fragments than segments is normal; more is not, and a short write would corrupt the file.
     log(t("segmentIndexSkipped", null, "\u5206\u7247\u6570\u8d85\u51fa\u9884\u7559\u7d22\u5f15\u7a7a\u95f4\uff0c\u672c\u6b21\u672a\u5199\u5165\u7d22\u5f15\u3002"));
     return;
   }
+  // Reserved capacity is usually larger than the final index; the leftover free box sits between
+  // sidx and the first moof, so first_offset must point past it (ISO/IEC 14496-12 8.16.3).
+  const leftover = sidxCapacity - WebKeeperMediaEngine.sidxByteLength(references.length);
+  const firstOffset = leftover >= 8 ? leftover : 0;
+  const sidx = WebKeeperMediaEngine.buildSidx(references, { firstOffset });
   await writable.write({ type: "write", position: sidxPosition, data: sidx });
   // Whatever is left of the reservation stays a valid, ignored box.
-  const leftover = sidxCapacity - sidx.byteLength;
   if (leftover >= 8) {
     await writable.write({ type: "write", position: sidxPosition + sidx.byteLength, data: WebKeeperMediaEngine.buildFreeBox(leftover) });
   }

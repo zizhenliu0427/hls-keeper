@@ -488,7 +488,9 @@ setTimeout(() => {
         # The remuxer emits a fragmented MP4; without an index a player must walk every fragment
         # before it can start, which on a network share is minutes of waiting.
         self.assertIn("async function writeSegmentIndex(", script)
-        self.assertIn("WebKeeperMediaEngine.buildSidx(references)", script)
+        # Leftover reserved space becomes a free box after sidx; first_offset must skip that gap.
+        self.assertIn("WebKeeperMediaEngine.buildSidx(references, { firstOffset })", script)
+        self.assertIn("const firstOffset = leftover >= 8 ? leftover : 0;", script)
         self.assertIn('await writable.write({ type: "write", position: sidxPosition, data: sidx });', script)
         # Space is reserved before the fragments, because a sidx has to precede what it indexes.
         self.assertIn("sidxCapacity = WebKeeperMediaEngine.sidxByteLength(expected.length + 16);", script)

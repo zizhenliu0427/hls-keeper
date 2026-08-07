@@ -9,9 +9,15 @@ A sidx has to sit before the fragments it indexes, and an existing file has no r
 file is rewritten: the same bytes with the index spliced in after moov. Nothing is decoded and
 nothing is re-encoded, so this runs at whatever the storage can stream.
 
+Exports that reserved a free box after sidx sometimes wrote first_offset=0. Strict players then
+start reading inside the free pad and fall back to walking every fragment. --fix-offset patches
+just those 8 bytes in place.
+
 Usage:
     python scripts/add_segment_index.py FILE [FILE ...]
-    python scripts/add_segment_index.py --check FILE      # report only, write nothing
+    python scripts/add_segment_index.py --check FILE           # report only, write nothing
+    python scripts/add_segment_index.py --fix-offset FILE     # patch first_offset in place
+    python scripts/add_segment_index.py --fix-offset --check FILE
 """
 from __future__ import annotations
 
@@ -81,6 +87,78 @@ def scan(path: Path):
         if pending is not None:
             fragments.append(pending)
     return {"total": total, "moov_end": moov_end, "fragments": fragments, "has_sidx": has_sidx}
+
+
+def inspect_sidx_gap(path: Path):
+    """Reads only the header boxes until the first moof — enough to validate first_offset."""
+    with path.open("rb") as handle:
+        total = handle.seek(0, 2)
+        handle.seek(0)
+        offset = 0
+        sidx_offset = None
+        sidx_end = None
+        sidx_first_offset = None
+        first_moof = None
+        while offset < min(total, 64 * 1024 * 1024):
+            handle.seek(offset)
+            box = read_box_header(handle)
+            if box is None:
+                break
+            name, _, size = box
+            if size <= 0:
+                break
+            if name == "sidx":
+                sidx_offset = offset
+                sidx_end = offset + size
+                handle.seek(offset + 8)
+                version = handle.read(1)[0]
+                handle.read(3)
+                handle.read(8)  # reference_ID + timescale
+                if version == 1:
+                    handle.read(8)
+                    sidx_first_offset = struct.unpack(">Q", handle.read(8))[0]
+                else:
+                    handle.read(4)
+                    sidx_first_offset = struct.unpack(">I", handle.read(4))[0]
+            elif name == "moof" and sidx_end is not None:
+                first_moof = offset
+                break
+            offset += size
+    if sidx_offset is None or sidx_end is None or first_moof is None or sidx_first_offset is None:
+        return None
+    return {
+        "sidx_offset": sidx_offset,
+        "sidx_end": sidx_end,
+        "first_offset": sidx_first_offset,
+        "gap": first_moof - sidx_end,
+    }
+
+
+def fix_first_offset(path: Path, dry_run: bool = False) -> bool:
+    """Patches sidx.first_offset when a free pad sits between sidx and the first moof."""
+    info = inspect_sidx_gap(path)
+    print(f"{path.name}")
+    if info is None:
+        print("  no sidx ahead of moof — nothing to patch")
+        return True
+    print(f"  first_offset={info['first_offset']}, gap_to_moof={info['gap']}")
+    if info["first_offset"] == info["gap"]:
+        print("  already correct")
+        return True
+    if dry_run:
+        print(f"  would patch first_offset -> {info['gap']}")
+        return True
+    with path.open("r+b") as handle:
+        # version-1 sidx: first_offset is the uint64 at byte 28 of the box.
+        handle.seek(info["sidx_offset"] + 8)
+        version = handle.read(1)[0]
+        if version != 1:
+            print(f"  unsupported sidx version {version}")
+            return False
+        handle.seek(info["sidx_offset"] + 28)
+        handle.write(struct.pack(">Q", info["gap"]))
+    print(f"  patched first_offset -> {info['gap']}")
+    return True
 
 
 def sidx_bytes(references, earliest=0, timescale=TIMESCALE):
@@ -248,6 +326,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("files", nargs="+", type=Path)
     parser.add_argument("--check", action="store_true", help="report what would be done, write nothing")
+    parser.add_argument(
+        "--fix-offset",
+        action="store_true",
+        help="patch sidx.first_offset in place when a free pad follows the index",
+    )
     args = parser.parse_args()
     ok = True
     for path in args.files:
@@ -256,7 +339,10 @@ def main() -> int:
             ok = False
             continue
         try:
-            ok = retrofit(path, dry_run=args.check) and ok
+            if args.fix_offset:
+                ok = fix_first_offset(path, dry_run=args.check) and ok
+            else:
+                ok = retrofit(path, dry_run=args.check) and ok
         except Exception as error:                     # noqa: BLE001 - report and continue
             print(f"{path.name}: failed — {error}")
             ok = False
